@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Wire.h>
+#include <driver/i2s.h>
 #include <ArduinoJson.h>
 
 // ============ 配置 ============
