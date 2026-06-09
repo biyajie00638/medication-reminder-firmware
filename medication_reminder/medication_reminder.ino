@@ -149,12 +149,11 @@ static bool i2s_init() {
         .use_apll            = true,
         .tx_desc_auto_clear  = true,
         .fixed_mclk          = 0,
-#ifdef SOC_I2S_SUPPORTS_MCLK
         .mclk_multiple       = I2S_MCLK_MULTIPLE_256,
-#endif
     };
 
     i2s_pin_config_t pins = {
+        .mck_io_num    = I2S_MCLK,
         .bck_io_num    = I2S_BCK,
         .ws_io_num     = I2S_WS,
         .data_out_num  = I2S_DOUT,
@@ -172,11 +171,6 @@ static bool i2s_init() {
         Serial.printf("[I2S] Set pin failed: %d\n", err);
         return false;
     }
-
-    // MCLK output
-    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO48_U, FUNC_GPIO48_CLK_OUT3);
-    REG_SET_FIELD(PIN_CTRL, CLK_OUT3, 0);
-    REG_WRITE(GPIO_ENABLE_W1TS_REG, BIT48);
 
     Serial.println("[I2S] Initialized");
     return true;
