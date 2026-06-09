@@ -41,18 +41,18 @@ const int   POLL_INTERVAL  = 2000;          // 轮询间隔(ms)
 // ============ ES8311 初始化寄存器序列 ============
 // 参考 datasheet 和 xiaozhi-esp32 代码
 static void es8311_write_reg(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(ES8311_ADDR);
-    Wire.write(reg);
-    Wire.write(val);
-    Wire.endTransmission();
+    Wire1.beginTransmission(ES8311_ADDR);
+    Wire1.write(reg);
+    Wire1.write(val);
+    Wire1.endTransmission();
 }
 
 static bool es8311_init() {
-    Wire.begin(I2C_SDA, I2C_SCL, 100000);
+    Wire1.begin(I2C_SDA, I2C_SCL, 100000);
 
     // 检查芯片是否存在
-    Wire.beginTransmission(ES8311_ADDR);
-    if (Wire.endTransmission() != 0) {
+    Wire1.beginTransmission(ES8311_ADDR);
+    if (Wire1.endTransmission() != 0) {
         Serial.println("[ES8311] Chip not found on I2C bus!");
         return false;
     }
