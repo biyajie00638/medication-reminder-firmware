@@ -35,16 +35,26 @@ const int   POLL_INTERVAL  = 2000;          // 轮询间隔(ms)
 #define I2S_BCK             17
 #define I2S_WS              47    // = LRCK
 #define I2S_DOUT            15
+#define PA_PIN              46    // 功放使能引脚
 #define SAMPLE_RATE         24000
 #define I2S_PORT            I2S_NUM_0
 
-// ============ ES8311 初始化寄存器序列 ============
-// 参考 datasheet 和 xiaozhi-esp32 代码
+// ============ ES8311 初始化 — ESP-BSP 官方寄存器序列 ============
+// 来源: espressif/esp-bsp components/es8311/es8311.c
+// MCLK=6.144MHz (256×24kHz), fs=24kHz, 16-bit I2S, DAC-only slave mode
 static void es8311_write_reg(uint8_t reg, uint8_t val) {
     Wire1.beginTransmission(ES8311_ADDR);
     Wire1.write(reg);
     Wire1.write(val);
     Wire1.endTransmission();
+}
+
+static uint8_t es8311_read_reg(uint8_t reg) {
+    Wire1.beginTransmission(ES8311_ADDR);
+    Wire1.write(reg);
+    Wire1.endTransmission(false);
+    Wire1.requestFrom((uint8_t)ES8311_ADDR, (uint8_t)1);
+    return Wire1.available() ? Wire1.read() : 0;
 }
 
 static bool es8311_init() {
@@ -58,81 +68,50 @@ static bool es8311_init() {
     }
     Serial.println("[ES8311] Found!");
 
-    // Reset
-    es8311_write_reg(0x00, 0x7F);
-    es8311_write_reg(0x00, 0x80);
-    es8311_write_reg(0x00, 0x00);
+    // === 1. 复位序列 ===
+    es8311_write_reg(0x00, 0x1F);   // 复位芯片
+    delay(20);
+    es8311_write_reg(0x00, 0x00);   // 清除复位
+    es8311_write_reg(0x00, 0x80);   // 上电命令
     delay(10);
 
-    // Clock: PLL → MCLK=12.288MHz, fs=24kHz
-    // Set LRCK divider (N) and BCLK divider
-    es8311_write_reg(0x01, 0x3F);   // Power up VMID
-    es8311_write_reg(0x02, 0x00);   // Power up various blocks
-    es8311_write_reg(0x03, 0x28);   // MCLK from MCLK pin
-    es8311_write_reg(0x04, 0x1F);   // Divider control
-    es8311_write_reg(0x05, 0x00);   
-    es8311_write_reg(0x06, 0x00);   // Slave mode
-    es8311_write_reg(0x07, 0x0A);   // Fs = 24kHz (96*256=24576kHz → divider)
-    es8311_write_reg(0x08, 0x0A);   
-    es8311_write_reg(0x09, 0x00);   // ADC off
-    es8311_write_reg(0x0A, 0x80);   // DAC powered up
-    es8311_write_reg(0x0B, 0x00);   
-    es8311_write_reg(0x0C, 0x02);   // I2S 16-bit
-    es8311_write_reg(0x0D, 0x02);   
-    es8311_write_reg(0x0E, 0x02);   
-    es8311_write_reg(0x0F, 0x80);   
+    // === 2. 时钟配置: MCLK pin, 不反相, 所有内部时钟使能 ===
+    es8311_write_reg(0x01, 0x3F);
 
-    // Analog: power up DAC
-    es8311_write_reg(0x10, 0x00);
-    es8311_write_reg(0x11, 0xBF);   // Power up
-    es8311_write_reg(0x12, 0x80);   
-    es8311_write_reg(0x13, 0x00);   
-    es8311_write_reg(0x14, 0x12);   // Analog Vol
-    es8311_write_reg(0x15, 0x00);
-    es8311_write_reg(0x16, 0x40);   // HP driver
-    es8311_write_reg(0x17, 0x80);
-    es8311_write_reg(0x18, 0x00);
+    // === 3. 时钟分频器: MCLK=6.144MHz, fs=24kHz ===
+    // coeff_div 表: {6144000,24000, pre_div=1,pre_multi=0, adc_div=1,dac_div=1,
+    //                  fs_mode=0, lrck_h=0,lrck_l=0xFF, bclk_div=4, adc_osr=0x10,dac_osr=0x10}
+    es8311_write_reg(0x02, 0x00);   // pre_div=1→(1-1)<<5=0, pre_multi=0→0<<3=0
+    es8311_write_reg(0x03, 0x10);   // fs_mode=0→0<<6=0, adc_osr=0x10
+    es8311_write_reg(0x04, 0x10);   // dac_osr=0x10
+    es8311_write_reg(0x05, 0x00);   // adc_div=1→0<<4=0, dac_div=1→0
+    es8311_write_reg(0x06, 0x03);   // bclk_div=4→(4-1)=3
+    es8311_write_reg(0x07, 0x00);   // lrck_h=0
+    es8311_write_reg(0x08, 0xFF);   // lrck_l=0xFF
 
-    // GPIO / general
-    es8311_write_reg(0x19, 0x00);
-    es8311_write_reg(0x1A, 0x00);
-    es8311_write_reg(0x1B, 0x00);
-    es8311_write_reg(0x1C, 0x00);
-    es8311_write_reg(0x1D, 0x00);
-    es8311_write_reg(0x1E, 0x00);
-    es8311_write_reg(0x1F, 0x00);
-    es8311_write_reg(0x20, 0x00);
-    es8311_write_reg(0x21, 0x00);
-    es8311_write_reg(0x22, 0x00);
-    
-    // ADC (disabled)
-    es8311_write_reg(0x23, 0x00);
-    es8311_write_reg(0x24, 0x00);
-    es8311_write_reg(0x25, 0x00);
-    es8311_write_reg(0x26, 0x00);
-    es8311_write_reg(0x27, 0x00);
-    es8311_write_reg(0x28, 0x00);
-    es8311_write_reg(0x29, 0x00);
+    // === 4. I2S 格式: 从模式 slave, 16-bit ===
+    uint8_t reg00 = es8311_read_reg(0x00);
+    es8311_write_reg(0x00, reg00 & 0xBF);  // 清除 bit6 → 从模式
+    es8311_write_reg(0x09, 0x0C);   // SDP输入 16-bit: 3<<2=0x0C
+    es8311_write_reg(0x0A, 0x0C);   // SDP输出 16-bit: 3<<2=0x0C
 
-    // GPIO config
-    es8311_write_reg(0x2A, 0x00);
-    es8311_write_reg(0x2B, 0x00);
+    // === 5. 模拟电路上电 ===
+    es8311_write_reg(0x0D, 0x01);   // 上电模拟电路
+    es8311_write_reg(0x0E, 0x02);   // 使能 PGA + ADC 调制器
+    es8311_write_reg(0x12, 0x00);   // 上电 DAC
+    es8311_write_reg(0x13, 0x10);   // 使能耳机驱动输出
 
-    // Test mode off
-    es8311_write_reg(0x2C, 0x00);
-    es8311_write_reg(0x2D, 0x00);
-    es8311_write_reg(0x2E, 0x00);
-    
-    // DAC volume (0dB)
-    es8311_write_reg(0x2F, 0x00);
-    es8311_write_reg(0x30, 0x00);
-    
-    // Unmute
-    es8311_write_reg(0x31, 0xC0);
-    es8311_write_reg(0x32, 0x50);
-    es8311_write_reg(0x33, 0x50);
+    // === 6. DAC 均衡器旁路 ===
+    es8311_write_reg(0x37, 0x08);   // 旁路 DAC EQ
 
-    Serial.println("[ES8311] Initialized OK");
+    // === 7. 音量最大 (DAC_REG32, 0=静音, 255=最大) ===
+    es8311_write_reg(0x20, 0xFF);   // 音量 100% → (100*256/100)-1 = 255 = 0xFF
+
+    // === 8. 取消静音 (清除 DAC_REG31 bits 5,6) ===
+    uint8_t reg1f = es8311_read_reg(0x1F);
+    es8311_write_reg(0x1F, reg1f & ~(0x60));  // 清除 bit5, bit6
+
+    Serial.println("[ES8311] Initialized OK (ESP-BSP sequence)");
     return true;
 }
 
@@ -339,6 +318,11 @@ void setup() {
     }
 
     // 音频硬件初始化
+    // PA 功放使能 (GPIO46) — 必须在 ES8311 初始化之前拉高
+    pinMode(PA_PIN, OUTPUT);
+    digitalWrite(PA_PIN, HIGH);
+    Serial.println("[PA] Amplifier enabled (GPIO46)");
+
     if (!es8311_init()) {
         Serial.println("[Fatal] ES8311 init failed!");
     }
