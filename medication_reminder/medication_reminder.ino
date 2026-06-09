@@ -14,27 +14,27 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Wire.h>
-#include <driver/i2s.h>
+#include <driver/i2s.h>    // I2S 类型定义（setup 里用到了 I2S_NUM_0 等）
 #include <ArduinoJson.h>
 
 // ============ 配置 ============
-const char* WIFI_SSID      = "CHANGE_ME";   // ← 改成你的 WiFi 名
-const char* WIFI_PASSWORD  = "CHANGE_ME";   // ← 改成你的 WiFi 密码
+const char* WIFI_SSID      = "lvgu-1";
+const char* WIFI_PASSWORD  = "lvgu8888";
 const char* SERVER_HOST    = "YOUR_SERVER_IP";
 const int   SERVER_PORT    = 8003;
 const char* DEVICE_MAC     = "e8:f6:0a:a8:c3:bc";
 const int   POLL_INTERVAL  = 2000;          // 轮询间隔(ms)
 
-// ============ ES8311 I2C ============
+// ============ ES8311 I2C (Wire1 总线, ESP-BOX-3 官方引脚) ============
 #define ES8311_ADDR         0x18
-#define I2C_SDA             41    // ESP-BOX-3 pin
-#define I2C_SCL             42    // ESP-BOX-3 pin
+#define I2C_SDA             8
+#define I2C_SCL             18
 
-// ============ I2S ============
-#define I2S_BCK             17    // ESP-BOX-3 pin
-#define I2S_WS              16    // ESP-BOX-3 pin
-#define I2S_DOUT            15    // ESP-BOX-3 pin
-#define I2S_MCLK            48    // ESP-BOX-3 pin
+// ============ I2S (ESP-BOX-3 官方引脚) ============
+#define I2S_MCLK            2
+#define I2S_BCK             17
+#define I2S_WS              47    // = LRCK
+#define I2S_DOUT            15
 #define SAMPLE_RATE         24000
 #define I2S_PORT            I2S_NUM_0
 
@@ -313,9 +313,13 @@ static void poll_and_play() {
 // ============ 主循环 ============
 void setup() {
     Serial.begin(115200);
-    delay(1000);
+    delay(2000);  // 给 USB-serial 足够时间初始化
     Serial.println("\n\n=== Medication Reminder Firmware ===");
-    Serial.printf("MAC: %s\n", DEVICE_MAC);
+    Serial.printf("[INFO] Chip: %s Rev %d, Flash: %dMB, PSRAM: %s\n",
+                  ESP.getChipModel(), ESP.getChipRevision(),
+                  ESP.getFlashChipSize()/1024/1024,
+                  psramFound() ? "Yes" : "No");
+    Serial.printf("[INFO] Free heap: %d, MAC: %s\n", ESP.getFreeHeap(), DEVICE_MAC);
 
     // WiFi
     Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
@@ -334,7 +338,7 @@ void setup() {
         ESP.restart();
     }
 
-    // 音频硬件
+    // 音频硬件初始化
     if (!es8311_init()) {
         Serial.println("[Fatal] ES8311 init failed!");
     }
@@ -342,7 +346,11 @@ void setup() {
         Serial.println("[Fatal] I2S init failed!");
     }
 
-    Serial.println("[Ready] Polling...");
+    // 输出引脚图（方便排查）
+    Serial.printf("[Pins] I2C(SDA=%d,SCL=%d) I2S(MCLK=%d,BCK=%d,WS=%d,DOUT=%d)\n",
+                  I2C_SDA, I2C_SCL, I2S_MCLK, I2S_BCK, I2S_WS, I2S_DOUT);
+
+    Serial.println("[Ready] Polling server...");
 }
 
 void loop() {
@@ -360,6 +368,5 @@ void loop() {
         }
     }
 
-    // 喂狗
     delay(10);
 }

@@ -31,7 +31,7 @@ jobs:
       - name: Compile firmware
         run: |
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=huge_app,PSRAM=opi \
+            --fqbn esp32:esp32:esp32s3box:PartitionScheme=huge_app \
             --output-dir ./build \
             ./medication_reminder/medication_reminder.ino
           ls -la ./build/
