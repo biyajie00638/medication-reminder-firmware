@@ -156,6 +156,30 @@ static bool i2s_init() {
     return true;
 }
 
+// ============ 测试音 (1kHz 正弦波, 3秒) — 验证扬声器硬件 ============
+static void play_test_tone() {
+    Serial.println("[TestTone] Playing 1kHz sine wave for 3 seconds...");
+    const int freq = 1000;
+    const int duration_ms = 3000;
+    const int sample_rate = SAMPLE_RATE;
+    const int total_samples = sample_rate * duration_ms / 1000;
+    const int buf_samples = 512;
+    int16_t buf[buf_samples];
+
+    for (int i = 0; i < total_samples; i += buf_samples) {
+        int n = (total_samples - i) < buf_samples ? (total_samples - i) : buf_samples;
+        for (int j = 0; j < n; j++) {
+            // 1kHz sine, ±8000 amplitude (loud but not clipping)
+            float t = (float)(i + j) / sample_rate;
+            buf[j] = (int16_t)(8000.0f * sinf(2.0f * PI * freq * t));
+        }
+        size_t out_bytes;
+        i2s_write(I2S_PORT, buf, n * sizeof(int16_t), &out_bytes, portMAX_DELAY);
+    }
+    delay(100);  // let the last buffer drain
+    Serial.println("[TestTone] Done! Did you hear it?");
+}
+
 // ============ 播放 WAV 数据 ============
 static void play_wav(const uint8_t* data, size_t len) {
     if (len < 44) {
@@ -333,6 +357,9 @@ void setup() {
     // 输出引脚图（方便排查）
     Serial.printf("[Pins] I2C(SDA=%d,SCL=%d) I2S(MCLK=%d,BCK=%d,WS=%d,DOUT=%d)\n",
                   I2C_SDA, I2C_SCL, I2S_MCLK, I2S_BCK, I2S_WS, I2S_DOUT);
+
+    // 播放测试音 — 验证扬声器硬件是否正常工作
+    play_test_tone();
 
     Serial.println("[Ready] Polling server...");
 }
