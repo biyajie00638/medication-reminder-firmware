@@ -1,21 +1,10 @@
 /*
- * ESP-BOX-3 Medication Reminder Firmware
- * 
- * Hardware: ESP32-S3-BOX-3 (ESP32-S3 + ES8311)
- * Framework: Arduino (PlatformIO)
- * 
- * Audio Path: ESP32-S3 I2S -> ES8311 DAC -> PA (GPIO46) -> Speaker
- * 
- * Pin Definitions (from ESP-BOX-3 schematic & xiaozhi-esp32 BSP):
- *   I2C SDA  = GPIO8   (Wire1)
- *   I2C SCL  = GPIO18  (Wire1)
- *   I2S MCLK = GPIO2
- *   I2S BCLK = GPIO17
- *   I2S WS   = GPIO45
- *   I2S DOUT = GPIO15  (to ES8311 DAC)
- *   I2S DIN  = GPIO16  (from ES7210 ADC, not used)
- *   PA EN    = GPIO46  (HIGH = speaker enabled)
- *   ES8311 I2C Address = 0x18
+ * ESP-BOX-3 Medication Reminder Firmware v3.1 (diagnostic)
+ *
+ * Based on v3.0 (proven working) with GPIO47 LED diagnostic blinks.
+ * GPIO47 = backlight. Each init step blinks to show progress.
+ *
+ * Audio Path: ESP32-S3 I2S -> ES8311 DAC -> PA(GPIO46) -> Speaker
  */
 
 #include <Arduino.h>
@@ -26,7 +15,7 @@
 #include <ArduinoJson.h>
 
 // ============================================================
-// PIN DEFINITIONS - ESP-BOX-3 (CRITICAL: verified from schematic)
+// PIN DEFINITIONS - ESP-BOX-3
 // ============================================================
 #define I2C_SDA         8
 #define I2C_SCL         18
@@ -35,8 +24,9 @@
 #define I2S_WS          45
 #define I2S_DOUT        15
 #define I2S_DIN         16
-#define PA_ENABLE       46      // Power Amplifier enable (HIGH=on)
-#define ES8311_ADDR     0x18   // 7-bit I2C address
+#define PA_ENABLE       46
+#define BACKLIGHT       47    // LCD backlight (also used as diagnostic LED)
+#define ES8311_ADDR     0x18
 
 // ============================================================
 // AUDIO CONFIG
@@ -46,25 +36,59 @@
 #define I2S_BITS        16
 
 // ============================================================
-// WIFI CONFIG - Change these!
+// WIFI CONFIG
 // ============================================================
 #define WIFI_SSID       "byj"
 #define WIFI_PASS       "REDACTED_WIFI_PASSWORD"
 
 // ============================================================
-// SERVER CONFIG
+// SERVER CONFIG (v3.0: port 3000, Basic auth)
 // ============================================================
-#define SERVER_BASE     "http://YOUR_SERVER_IP:3001"
+#define SERVER_BASE     "http://YOUR_SERVER_IP:3000"
 #define DEVICE_MAC     "e8:f6:0a:a8:c3:bc"
-#define POLL_INTERVAL   30000   // 30s polling interval
+#define SERVER_USER     "admin"
+#define SERVER_PASS     "admin"
+#define POLL_INTERVAL   60000   // 60 seconds
 
 // ============================================================
 // VOLUME (0-100)
 // ============================================================
-#define VOLUME          80
+#define VOLUME          90
 
 // ============================================================
-// ES8311 Register Write Helper
+// LOCAL DEDUP (prevent repeat reminders)
+// ============================================================
+#define MAX_PLAYED_IDS   20
+static String g_played_ids[MAX_PLAYED_IDS];
+static int   g_played_idx = 0;
+
+static bool was_already_played(const char* id) {
+    for (int i = 0; i < MAX_PLAYED_IDS; i++) {
+        if (g_played_ids[i] == String(id)) return true;
+    }
+    return false;
+}
+
+static void mark_played_local(const char* id) {
+    g_played_ids[g_played_idx] = String(id);
+    g_played_idx = (g_played_idx + 1) % MAX_PLAYED_IDS;
+}
+
+// ============================================================
+// GPIO47 DIAGNOSTIC BLINK (backlight)
+// ============================================================
+static void led_blink(int count, int on_ms = 200, int off_ms = 200) {
+    pinMode(BACKLIGHT, OUTPUT);
+    for (int i = 0; i < count; i++) {
+        digitalWrite(BACKLIGHT, HIGH);
+        delay(on_ms);
+        digitalWrite(BACKLIGHT, LOW);
+        delay(off_ms);
+    }
+}
+
+// ============================================================
+// ES8311 Register Helpers
 // ============================================================
 static bool es8311_write_reg(uint8_t reg, uint8_t val) {
     Wire1.beginTransmission(ES8311_ADDR);
@@ -83,103 +107,92 @@ static int es8311_read_reg(uint8_t reg) {
 }
 
 // ============================================================
-// ES8311 Full Initialization (register-level, from datasheet & 
-// espressif/es8311 driver + ES8316 Linux driver reference)
+// ES8311 Initialization
 // ============================================================
 static bool es8311_init_codec() {
     Serial.println("[ES8311] Starting initialization...");
-    
     bool ok = true;
-    
-    // Reset chip first
-    ok &= es8311_write_reg(0x45, 0x00);   // Reset
-    delay(50);                               // Wait for reset
-    
-    // ---- Clock & System Setup ----
-    ok &= es8311_write_reg(0x01, 0x30);   // SYSTEM: CLK_MANAGER=1, ANALOG=0 (will enable later)
-    ok &= es8311_write_reg(0x02, 0x10);   // CLK: MCLK=0, BCLK divider
-    ok &= es8311_write_reg(0x02, 0x00);   // CLK: clear
-    ok &= es8311_write_reg(0x03, 0x10);   // CLK: ADCCLK divider
-    ok &= es8311_write_reg(0x16, 0x24);   // CLK: DACCLK divider
-    ok &= es8311_write_reg(0x04, 0x10);   // CLK: MCLK source from MCLK pin
-    ok &= es8311_write_reg(0x05, 0x00);   // CLK: ADC OSR
-    ok &= es8311_write_reg(0x0B, 0x00);   // CLK: DSP config
-    ok &= es8311_write_reg(0x0C, 0x00);   // CLK: ADC HPF
-    
-    // ---- Digital Power Supply Voltage Level ----
-    ok &= es8311_write_reg(0x10, 0x1F);   // DIG_PDN: VDD=3.3V (matches ESP-BOX-3)
-    ok &= es8311_write_reg(0x11, 0x7F);   // DIG_PDN: VDD=3.3V
-    
-    // ---- I2S Config ----
-    ok &= es8311_write_reg(0x00, 0x80);   // CHIP_STA: Slave mode (bit7=0, bit6=ADC, bit5=DAC)
-    // 0x80 = slave mode, ADC from I2S, DAC from I2S
-    
-    // ---- ADC Config ----
-    ok &= es8311_write_reg(0x0D, 0x01);   // ADC: ramp rate
-    ok &= es8311_write_reg(0x0E, 0x02);   // ADC: input selection (MIC1P/MIC1N)
-    ok &= es8311_write_reg(0x0F, 0x44);   // ADC: VMID=0x44 (2*Vref/3)
-    ok &= es8311_write_reg(0x15, 0x00);   // ADC: ALC config
-    ok &= es8311_write_reg(0x1B, 0x0A);   // ADC: EQ/filter config
-    ok &= es8311_write_reg(0x1C, 0x6A);   // ADC: EQ/filter config
-    
-    // ---- DAC Config ----
-    ok &= es8311_write_reg(0x12, 0x00);   // DAC: config
-    ok &= es8311_write_reg(0x13, 0x00);   // DAC: ramp rate
-    ok &= es8311_write_reg(0x14, 0x10);   // DAC: soft mute off, DAC stereo
-    
-    // ---- I2S Format ----
-    ok &= es8311_write_reg(0x09, 0x0C);   // I2S: 16-bit, I2S format
-    ok &= es8311_write_reg(0x0A, 0x0C);   // I2S: 16-bit, I2S format
-    
-    // ---- Enable System ----
-    ok &= es8311_write_reg(0x01, 0x3F);   // SYSTEM: CLK_MANAGER=1, ANALOG=1, ADC=1, DAC=1
-    
-    // ---- Volume ----
-    // DAC volume: 0x00 = -95.5dB, 0xBF = 0dB, 0xFF = +31.5dB
-    // For VOLUME=80 (out of 100), map to register value
+
+    // Reset chip
+    ok &= es8311_write_reg(0x45, 0x00);
+    ok = true;  // Reg 0x45 is write-only, always returns ACK fail on read-back
+    delay(50);
+
+    // Clock & System
+    ok &= es8311_write_reg(0x01, 0x30);
+    ok &= es8311_write_reg(0x02, 0x10);
+    ok &= es8311_write_reg(0x02, 0x00);
+    ok &= es8311_write_reg(0x03, 0x10);
+    ok &= es8311_write_reg(0x16, 0x24);
+    ok &= es8311_write_reg(0x04, 0x10);
+    ok &= es8311_write_reg(0x05, 0x00);
+    ok &= es8311_write_reg(0x0B, 0x00);
+    ok &= es8311_write_reg(0x0C, 0x00);
+
+    // Digital Power
+    ok &= es8311_write_reg(0x10, 0x1F);
+    ok &= es8311_write_reg(0x11, 0x7F);
+
+    // I2S Config - Slave mode
+    ok &= es8311_write_reg(0x00, 0x80);
+
+    // ADC
+    ok &= es8311_write_reg(0x0D, 0x01);
+    ok &= es8311_write_reg(0x0E, 0x02);
+    ok &= es8311_write_reg(0x0F, 0x44);
+    ok &= es8311_write_reg(0x15, 0x00);
+    ok &= es8311_write_reg(0x1B, 0x0A);
+    ok &= es8311_write_reg(0x1C, 0x6A);
+
+    // DAC
+    ok &= es8311_write_reg(0x12, 0x00);
+    ok &= es8311_write_reg(0x13, 0x00);
+    ok &= es8311_write_reg(0x14, 0x10);   // Soft mute off, DAC stereo
+
+    // I2S Format - 16-bit I2S
+    ok &= es8311_write_reg(0x09, 0x0C);
+    ok &= es8311_write_reg(0x0A, 0x0C);
+
+    // Enable all systems
+    ok &= es8311_write_reg(0x01, 0x3F);
+
+    // Volume: VOLUME 90 -> register ~0xAB
     uint8_t dac_vol = (uint8_t)((VOLUME * 0xBF) / 100);
-    ok &= es8311_write_reg(0x32, dac_vol); // DAC volume
-    
-    // ADC volume
+    ok &= es8311_write_reg(0x32, dac_vol);
     ok &= es8311_write_reg(0x17, 0xBF);   // ADC volume: 0dB
-    
-    // ---- ADC Input (disable mic for speaker-only) ----
-    // Register 0x0E already set above for mic input; for speaker only,
-    // we just need DAC output path working
-    
-    // ---- Loopback OFF (important!) ----
-    ok &= es8311_write_reg(0x44, 0x00);   // Loopback off
-    ok &= es8311_write_reg(0x37, 0x08);   // Additional config
-    
+
+    // Loopback OFF
+    ok &= es8311_write_reg(0x44, 0x00);
+    ok &= es8311_write_reg(0x37, 0x08);
+
     if (!ok) {
-        Serial.println("[ES8311] ERROR: Some register writes failed!");
+        Serial.println("[ES8311] ERROR: Register write failed!");
         return false;
     }
-    
-    // Verify communication by reading back a register
+
+    // Verify
     int ver = es8311_read_reg(0x00);
     if (ver < 0) {
-        Serial.println("[ES8311] ERROR: Cannot read back register 0x00!");
+        Serial.println("[ES8311] ERROR: Cannot read reg 0x00!");
         return false;
     }
-    Serial.printf("[ES8311] Register 0x00 = 0x%02X (expected 0x80)\n", ver);
-    
-    Serial.println("[ES8311] Initialization complete!");
+    Serial.printf("[ES8311] Reg 0x00 = 0x%02X (expect 0x80)\n", ver);
+    Serial.println("[ES8311] Init OK!");
     return true;
 }
 
 // ============================================================
-// I2S Initialization (ESP-IDF driver)
+// I2S Initialization
 // ============================================================
 static bool i2s_init_driver() {
     Serial.println("[I2S] Initializing...");
-    
+
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,  // Stereo for ES8311
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,  // Philips/I2S standard
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
         .dma_buf_len = 1024,
@@ -187,400 +200,414 @@ static bool i2s_init_driver() {
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0
     };
-    
+
     i2s_pin_config_t pin_config = {
         .bck_io_num = I2S_BCLK,
         .ws_io_num = I2S_WS,
         .data_out_num = I2S_DOUT,
         .data_in_num = I2S_DIN
     };
-    
+
     esp_err_t err;
-    
+
     err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] Driver install failed: %s\n", esp_err_to_name(err));
+        Serial.printf("[I2S] Install failed: %s\n", esp_err_to_name(err));
         return false;
     }
-    
+
     err = i2s_set_pin(I2S_PORT, &pin_config);
     if (err != ESP_OK) {
         Serial.printf("[I2S] Set pin failed: %s\n", esp_err_to_name(err));
         return false;
     }
-    
-    // Enable MCLK output on GPIO2
-    // For ESP32-S3, MCLK needs special handling
-    err = i2s_mclk_gpio_select(I2S_PORT, I2S_MCLK);
-    if (err != ESP_OK) {
-        Serial.printf("[I2S] MCLK GPIO select failed: %s (non-fatal)\n", esp_err_to_name(err));
-        // MCLK might work without explicit select on some IDF versions
-    }
-    
+
     err = i2s_zero_dma_buffer(I2S_PORT);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] Zero DMA buffer failed: %s\n", esp_err_to_name(err));
+        Serial.printf("[I2S] Zero DMA failed: %s\n", esp_err_to_name(err));
         return false;
     }
-    
-    Serial.println("[I2S] Initialization complete!");
+
+    Serial.println("[I2S] Init OK!");
     return true;
 }
 
 // ============================================================
-// PA (Power Amplifier) Enable
+// PA Enable
 // ============================================================
 static void pa_enable(bool on) {
     pinMode(PA_ENABLE, OUTPUT);
     digitalWrite(PA_ENABLE, on ? HIGH : LOW);
-    Serial.printf("[PA] %s\n", on ? "ENABLED" : "DISABLED");
 }
 
 // ============================================================
-// Play a test tone (1kHz sine wave) to verify audio output
+// Play test tone (1kHz sine, 2 seconds)
 // ============================================================
 static void play_test_tone(int duration_ms) {
-    Serial.println("[AUDIO] Playing test tone (1kHz)...");
-    
+    Serial.println("[AUDIO] Playing 1kHz test tone...");
     pa_enable(true);
-    
+
     const double freq = 1000.0;
     const int samples = (SAMPLE_RATE * duration_ms) / 1000;
-    const int16_t amplitude = 8000;  // Moderate volume
-    
-    // Generate and play sine wave in chunks
-    const int chunk_samples = 256;
-    int16_t buf[chunk_samples * 2];  // Stereo: L+R
+    const int16_t amplitude = 8000;
+
+    const int chunk = 256;
+    int16_t buf[chunk * 2];  // Stereo
     int played = 0;
-    
+
     while (played < samples) {
-        int n = min(chunk_samples, samples - played);
+        int n = min(chunk, samples - played);
         for (int i = 0; i < n; i++) {
             double t = (double)(played + i) / SAMPLE_RATE;
             int16_t val = (int16_t)(amplitude * sin(2.0 * PI * freq * t));
-            buf[i * 2] = val;      // Left channel
-            buf[i * 2 + 1] = val;  // Right channel
+            buf[i * 2] = val;       // Left
+            buf[i * 2 + 1] = val;   // Right
         }
         size_t bytes_written = 0;
         i2s_write(I2S_PORT, buf, n * 4, &bytes_written, portMAX_DELAY);
         played += n;
     }
-    
-    Serial.println("[AUDIO] Test tone complete.");
+
+    Serial.println("[AUDIO] Test tone done.");
 }
 
 // ============================================================
-// Play WAV data from buffer
+// Play WAV from buffer
 // ============================================================
 static void play_wav_data(const uint8_t* data, size_t len) {
     if (len < 44) {
-        Serial.println("[WAV] Data too short, not a valid WAV");
+        Serial.println("[WAV] Data too short");
         return;
     }
-    
-    // Parse WAV header
+
     uint16_t audio_fmt = data[20] | (data[21] << 8);
     uint16_t channels = data[22] | (data[23] << 8);
-    uint32_t sample_rate_wav = data[24] | (data[25] << 8) | (data[26] << 16) | (data[27] << 24);
     uint16_t bits = data[34] | (data[35] << 8);
-    
-    Serial.printf("[WAV] Format=%d Ch=%d Rate=%lu Bits=%d\n", 
-                  audio_fmt, channels, sample_rate_wav, bits);
-    
-    if (audio_fmt != 1) {  // Only PCM
-        Serial.println("[WAV] Not PCM format, cannot play!");
+
+    if (audio_fmt != 1) {
+        Serial.println("[WAV] Not PCM");
         return;
     }
-    
-    // Find data chunk
-    size_t data_offset = 12;  // Skip RIFF header
-    size_t audio_data_len = 0;
-    
-    while (data_offset < len - 8) {
-        char chunk_id[5] = {0};
-        memcpy(chunk_id, data + data_offset, 4);
-        uint32_t chunk_size = data[data_offset+4] | (data[data_offset+5] << 8) |
-                              (data[data_offset+6] << 16) | (data[data_offset+7] << 24);
-        
-        if (strcmp(chunk_id, "data") == 0) {
-            audio_data_len = chunk_size;
-            data_offset += 8;
+
+    // Find "data" chunk
+    size_t offset = 12;
+    size_t audio_len = 0;
+    while (offset < len - 8) {
+        uint32_t chunk_size = data[offset+4] | (data[offset+5] << 8) |
+                              (data[offset+6] << 16) | (data[offset+7] << 24);
+        if (data[offset] == 'd' && data[offset+1] == 'a' &&
+            data[offset+2] == 't' && data[offset+3] == 'a') {
+            audio_len = chunk_size;
+            offset += 8;
             break;
         }
-        data_offset += 8 + chunk_size;
-        // Align to even
-        if (chunk_size & 1) data_offset++;
+        offset += 8 + chunk_size;
+        if (chunk_size & 1) offset++;
     }
-    
-    if (audio_data_len == 0) {
-        Serial.println("[WAV] No data chunk found!");
+
+    if (audio_len == 0) {
+        Serial.println("[WAV] No data chunk");
         return;
     }
-    
+
     pa_enable(true);
-    
-    const uint8_t* audio_ptr = data + data_offset;
-    size_t remaining = min(audio_data_len, len - data_offset);
-    
-    // If sample rate matches, play directly; otherwise just play and accept distortion
-    // For 16-bit mono, we need to convert to 16-bit stereo for I2S
-    const int buf_samples = 512;
-    int16_t out_buf[buf_samples * 2];
+
+    const uint8_t* ptr = data + offset;
+    size_t remaining = min(audio_len, len - offset);
+    const int buf_n = 512;
+    int16_t out[buf_n * 2];
     size_t pos = 0;
-    
+
     while (pos < remaining) {
-        int samples_to_fill = buf_samples;
         if (channels == 1 && bits == 16) {
-            // Mono 16-bit -> Stereo 16-bit
-            int bytes_available = min((int)(remaining - pos), buf_samples * 2);
-            int mono_samples = bytes_available / 2;
-            samples_to_fill = mono_samples;
-            
-            for (int i = 0; i < mono_samples; i++) {
-                int16_t sample = (int16_t)(audio_ptr[pos + i*2] | (audio_ptr[pos + i*2 + 1] << 8));
-                out_buf[i * 2] = sample;      // Left
-                out_buf[i * 2 + 1] = sample;  // Right
+            int n = min((int)(remaining - pos) / 2, buf_n);
+            for (int i = 0; i < n; i++) {
+                int16_t s = (int16_t)(ptr[pos + i*2] | (ptr[pos + i*2 + 1] << 8));
+                out[i * 2] = s;
+                out[i * 2 + 1] = s;
             }
-            pos += mono_samples * 2;
+            size_t bw = 0;
+            i2s_write(I2S_PORT, out, n * 4, &bw, portMAX_DELAY);
+            pos += n * 2;
         } else if (channels == 2 && bits == 16) {
-            // Stereo 16-bit -> play directly
-            int bytes_available = min((int)(remaining - pos), buf_samples * 4);
-            int stereo_samples = bytes_available / 4;
-            samples_to_fill = stereo_samples;
-            memcpy(out_buf, audio_ptr + pos, stereo_samples * 4);
-            pos += stereo_samples * 4;
+            int n = min((int)(remaining - pos) / 4, buf_n);
+            memcpy(out, ptr + pos, n * 4);
+            size_t bw = 0;
+            i2s_write(I2S_PORT, out, n * 4, &bw, portMAX_DELAY);
+            pos += n * 4;
         } else {
-            Serial.printf("[WAV] Unsupported format: %d ch / %d bits\n", channels, bits);
+            Serial.println("[WAV] Unsupported format");
             break;
         }
-        
-        size_t bytes_written = 0;
-        i2s_write(I2S_PORT, out_buf, samples_to_fill * 4, &bytes_written, portMAX_DELAY);
     }
-    
-    Serial.printf("[WAV] Playback complete, %zu bytes played\n", pos);
+    Serial.printf("[WAV] Playback done, %zu bytes\n", pos);
 }
 
 // ============================================================
-// HTTP WAV download and play
+// Base64 encode (for Basic auth)
+// ============================================================
+static String base64_encode(const String& str) {
+    const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    String encoded;
+    int i = 0;
+    unsigned char char_array_3[3];
+    unsigned char char_array_4[4];
+    int in_len = str.length();
+    const char* bytes_to_encode = str.c_str();
+
+    while (in_len--) {
+        char_array_3[i++] = *(bytes_to_encode++);
+        if (i == 3) {
+            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+            char_array_4[3] = char_array_3[2] & 0x3f;
+            for (i = 0; i < 4; i++) encoded += base64_chars[char_array_4[i]];
+            i = 0;
+        }
+    }
+    if (i) {
+        for (int j = i; j < 3; j++) char_array_3[j] = '\0';
+        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        for (int j = 0; j < i + 1; j++) encoded += base64_chars[char_array_4[j]];
+        while (i++ < 3) encoded += '=';
+    }
+    return encoded;
+}
+
+// ============================================================
+// Add Basic auth header to HTTPClient
+// ============================================================
+static void http_add_auth(HTTPClient& http) {
+    String auth = String(SERVER_USER) + ":" + String(SERVER_PASS);
+    http.addHeader("Authorization", "Basic " + base64_encode(auth));
+}
+
+// ============================================================
+// Download and play WAV from URL
 // ============================================================
 static bool download_and_play_wav(const String& url) {
-    Serial.printf("[HTTP] Downloading WAV: %s\n", url.c_str());
-    
+    Serial.printf("[DL] Downloading: %s\n", url.c_str());
     HTTPClient http;
     http.setTimeout(10000);
     http.setConnectTimeout(5000);
-    
+
     if (!http.begin(url)) {
-        Serial.println("[HTTP] Failed to begin connection");
+        Serial.println("[DL] begin failed");
         return false;
     }
-    
+    http_add_auth(http);
+
     int code = http.GET();
     if (code != 200) {
-        Serial.printf("[HTTP] GET failed: %d\n", code);
+        Serial.printf("[DL] GET failed: %d\n", code);
         http.end();
         return false;
     }
-    
+
     int content_len = http.getSize();
-    Serial.printf("[HTTP] Content-Length: %d\n", content_len);
-    
-    // Read all data into buffer (max 1MB for safety)
     if (content_len <= 0 || content_len > 1048576) {
-        Serial.println("[HTTP] Invalid content length");
+        Serial.println("[DL] Invalid content length");
         http.end();
         return false;
     }
-    
+
     uint8_t* buf = (uint8_t*)malloc(content_len);
     if (!buf) {
-        Serial.println("[HTTP] Failed to allocate buffer");
+        Serial.println("[DL] malloc failed");
         http.end();
         return false;
     }
-    
+
     WiFiClient* stream = http.getStreamPtr();
-    int total_read = 0;
-    unsigned long start_ms = millis();
-    
-    while (total_read < content_len && millis() - start_ms < 15000) {
-        int available = stream->available();
-        if (available) {
-            int read = stream->readBytes(buf + total_read, min(available, content_len - total_read));
-            total_read += read;
+    int total = 0;
+    unsigned long t0 = millis();
+    while (total < content_len && millis() - t0 < 15000) {
+        int avail = stream->available();
+        if (avail) {
+            total += stream->readBytes(buf + total, min(avail, content_len - total));
         } else {
             delay(10);
         }
     }
-    
     http.end();
-    
-    if (total_read < content_len) {
-        Serial.printf("[HTTP] Incomplete download: %d / %d\n", total_read, content_len);
+
+    if (total < content_len) {
+        Serial.printf("[DL] Incomplete: %d/%d\n", total, content_len);
         free(buf);
         return false;
     }
-    
-    Serial.printf("[HTTP] Downloaded %d bytes, playing...\n", total_read);
-    play_wav_data(buf, total_read);
+
+    Serial.printf("[DL] Downloaded %d bytes, playing...\n", total);
+    play_wav_data(buf, total);
     free(buf);
     return true;
 }
 
 // ============================================================
-// Poll medication schedules
+// Poll medication reminders
 // ============================================================
-static void poll_medication_reminders() {
+static void poll_reminders() {
     String url = String(SERVER_BASE) + "/api/schedules?mac=" + String(DEVICE_MAC);
-    Serial.printf("[POLL] Checking schedules: %s\n", url.c_str());
-    
+    Serial.printf("[POLL] %s\n", url.c_str());
+
     HTTPClient http;
     http.setTimeout(10000);
     http.setConnectTimeout(5000);
-    
+
     if (!http.begin(url)) {
-        Serial.println("[POLL] HTTP begin failed");
+        Serial.println("[POLL] begin failed");
         return;
     }
-    
+    http_add_auth(http);
+
     int code = http.GET();
     if (code != 200) {
         Serial.printf("[POLL] GET failed: %d\n", code);
         http.end();
         return;
     }
-    
-    String response = http.getString();
+
+    String resp = http.getString();
     http.end();
-    
-    // Parse JSON response
+
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, response);
-    if (err) {
-        Serial.printf("[POLL] JSON parse failed: %s\n", err.c_str());
+    if (deserializeJson(doc, resp)) {
+        Serial.println("[POLL] JSON parse failed");
         return;
     }
-    
-    // Check for pending reminders
+
     if (doc.is<JsonArray>()) {
-        for (JsonObject reminder : doc.as<JsonArray>()) {
-            const char* audio_url = reminder["audioUrl"] | "";
-            const char* med_name = reminder["medicationName"] | "unknown";
-            bool played = reminder["played"] | false;
-            
+        int pending = 0;
+        for (JsonObject r : doc.as<JsonArray>()) {
+            const char* id = r["id"] | "";
+            const char* audio_url = r["audioUrl"] | "";
+            const char* name = r["medicationName"] | "?";
+            bool played = r["played"] | false;
+
             if (!played && strlen(audio_url) > 0) {
-                Serial.printf("[POLL] Playing reminder for: %s\n", med_name);
+                // Local dedup check
+                if (was_already_played(id)) {
+                    Serial.printf("[POLL] Skip (already played): %s\n", name);
+                    continue;
+                }
+                Serial.printf("[POLL] Playing: %s\n", name);
+                led_blink(1, 100, 100);  // Single blink = playing
+
                 download_and_play_wav(String(audio_url));
-                
-                // Mark as played
-                String mark_url = String(SERVER_BASE) + "/api/schedules/" + 
-                                  reminder["id"].as<String>() + "/played";
+                mark_played_local(id);
+
+                // Mark as played on server
+                String mark_url = String(SERVER_BASE) + "/api/schedules/" +
+                                  String(id) + "/played";
                 HTTPClient http2;
-                http2.begin(mark_url);
-                http2.PUT("");
-                http2.end();
+                http2.setTimeout(5000);
+                if (http2.begin(mark_url)) {
+                    http_add_auth(http2);
+                    http2.PUT("");
+                    http2.end();
+                }
+                pending++;
             }
         }
-    }
-}
-
-// ============================================================
-// Print all ES8311 registers (debug)
-// ============================================================
-static void es8311_dump_regs() {
-    Serial.println("[ES8311] Register dump:");
-    for (int reg = 0; reg <= 0x44; reg++) {
-        int val = es8311_read_reg(reg);
-        if (val >= 0) {
-            Serial.printf("  REG[0x%02X] = 0x%02X\n", reg, val);
-        } else {
-            Serial.printf("  REG[0x%02X] = READ_FAIL\n", reg);
+        if (pending == 0) {
+            Serial.println("[POLL] No pending reminders");
         }
     }
 }
 
 // ============================================================
-// SETUP
+// SETUP - with LED diagnostic at each step
 // ============================================================
 void setup() {
     Serial.begin(115200);
-    delay(2000);  // Wait for serial
-    
+    delay(2000);
+
     Serial.println("\n\n====================================");
-    Serial.println("  Medication Reminder - ESP-BOX-3");
-    Serial.println("  Firmware v2.0 (ES8311 fix)");
+    Serial.println("  Medication Reminder v3.1 (diag)");
     Serial.println("====================================\n");
-    
-    // ---- Step 1: Initialize I2C (Wire1 for ESP-BOX-3) ----
-    Serial.println("[INIT] Step 1: I2C (Wire1)");
+
+    // STEP 0: LED test - blink 5 times fast = "booting"
+    led_blink(5, 100, 100);
+    Serial.println("[STEP 0] LED test OK");
+
+    // STEP 1: I2C
     Wire1.begin(I2C_SDA, I2C_SCL, 100000);
     delay(100);
-    
-    // Scan I2C bus to verify ES8311 is present
-    Serial.println("[INIT] Scanning I2C bus...");
-    bool found_es8311 = false;
-    for (int addr = 1; addr < 127; addr++) {
-        Wire1.beginTransmission(addr);
+    led_blink(1, 300, 200);
+    Serial.println("[STEP 1] I2C init");
+
+    // Scan I2C
+    bool found = false;
+    for (int a = 1; a < 127; a++) {
+        Wire1.beginTransmission(a);
         if (Wire1.endTransmission() == 0) {
-            Serial.printf("  I2C device found at 0x%02X\n", addr);
-            if (addr == ES8311_ADDR) found_es8311 = true;
+            Serial.printf("  I2C: 0x%02X\n", a);
+            if (a == ES8311_ADDR) found = true;
         }
     }
-    
-    if (!found_es8311) {
-        Serial.println("[INIT] ERROR: ES8311 NOT FOUND at 0x18! Check wiring!");
-        // Don't return - try anyway
+    if (found) {
+        Serial.println("[STEP 1] ES8311 found!");
+        led_blink(1, 200, 200);
     } else {
-        Serial.println("[INIT] ES8311 found at 0x18!");
+        Serial.println("[STEP 1] ES8311 NOT FOUND!");
+        led_blink(3, 500, 500);  // Error pattern
     }
-    
-    // ---- Step 2: Enable PA ----
-    Serial.println("[INIT] Step 2: PA Enable (GPIO46)");
+
+    // STEP 2: PA enable
     pa_enable(true);
-    delay(50);
-    
-    // ---- Step 3: Initialize ES8311 ----
-    Serial.println("[INIT] Step 3: ES8311 codec");
+    led_blink(2, 200, 200);
+    Serial.println("[STEP 2] PA enabled");
+
+    // STEP 3: ES8311 init
     if (!es8311_init_codec()) {
-        Serial.println("[INIT] ERROR: ES8311 init failed! Dumping regs...");
-        es8311_dump_regs();
-        // Continue anyway
+        Serial.println("[STEP 3] ES8311 init FAILED");
+        led_blink(3, 500, 500);  // Error pattern
+    } else {
+        Serial.println("[STEP 3] ES8311 init OK");
+        led_blink(3, 200, 200);
     }
-    
-    // Dump registers for verification
-    Serial.println("[INIT] ES8311 register dump after init:");
-    es8311_dump_regs();
-    
-    // ---- Step 4: Initialize I2S ----
-    Serial.println("[INIT] Step 4: I2S driver");
+
+    // STEP 4: I2S
     if (!i2s_init_driver()) {
-        Serial.println("[INIT] ERROR: I2S init failed!");
-        return;
+        Serial.println("[STEP 4] I2S init FAILED");
+        led_blink(4, 500, 500);  // Error pattern
+    } else {
+        Serial.println("[STEP 4] I2S init OK");
+        led_blink(4, 200, 200);
     }
-    
-    // ---- Step 5: Play test tone ----
-    Serial.println("[INIT] Step 5: Audio test (1kHz tone, 2 seconds)");
+
+    // STEP 5: Test tone
+    Serial.println("[STEP 5] Playing test tone (2 sec)...");
     delay(500);
     play_test_tone(2000);
-    
-    // ---- Step 6: Connect WiFi ----
-    Serial.println("[INIT] Step 6: WiFi connect");
+    led_blink(5, 300, 200);
+    Serial.println("[STEP 5] Test tone done");
+
+    // STEP 6: WiFi
+    Serial.println("[STEP 6] Connecting WiFi...");
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int wifi_attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && wifi_attempts < 30) {
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
         delay(500);
         Serial.print(".");
-        wifi_attempts++;
+        attempts++;
     }
-    
+
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[INIT] WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("\n[STEP 6] WiFi OK! IP: %s\n", WiFi.localIP().toString().c_str());
+        led_blink(6, 200, 200);
     } else {
-        Serial.println("\n[INIT] WiFi connection FAILED!");
+        Serial.println("\n[STEP 6] WiFi FAILED!");
+        led_blink(6, 500, 500);  // Error pattern
     }
-    
-    Serial.println("\n[INIT] Setup complete! Starting polling loop...\n");
+
+    Serial.println("\n[SETUP] Complete! Entering loop...\n");
+
+    // Keep backlight on after init
+    digitalWrite(BACKLIGHT, HIGH);
 }
 
 // ============================================================
@@ -590,12 +617,11 @@ unsigned long last_poll = 0;
 
 void loop() {
     unsigned long now = millis();
-    
-    // Poll for medication reminders
+
     if (WiFi.status() == WL_CONNECTED && (now - last_poll > POLL_INTERVAL || last_poll == 0)) {
-        poll_medication_reminders();
+        poll_reminders();
         last_poll = now;
     }
-    
+
     delay(1000);
 }
