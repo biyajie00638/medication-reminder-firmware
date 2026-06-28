@@ -18,7 +18,7 @@
  *   ES8311 I2C Address = 0x18
  *
  * LCD Pin Definitions (from ESP-BOX-3 BSP, confirmed ILI9341 panel):
- *   SPI MOSI  = GPIO6  (FSPI/SPI3_HOST)
+ *   SPI MOSI  = GPIO6  (SPI2_HOST, from official esp-brookesia BSP)
  *   SPI SCLK  = GPIO7
  *   SPI CS    = GPIO5
  *   SPI DC    = GPIO4
@@ -490,13 +490,11 @@ static bool lcd_bb_init_and_test() {
     
     delay(10);
     
-    // Hardware reset
-    Serial.println("[BB] Hardware reset...");
-    gpio_set_level((gpio_num_t)LCD_RST, HIGH);
+    // Hardware reset (reset_active_high=true: HIGH=reset, LOW=run)
+    Serial.println("[BB] Hardware reset (active HIGH)...");
+    gpio_set_level((gpio_num_t)LCD_RST, HIGH);  // Enter reset
     delay(10);
-    gpio_set_level((gpio_num_t)LCD_RST, LOW);
-    delay(20);
-    gpio_set_level((gpio_num_t)LCD_RST, HIGH);
+    gpio_set_level((gpio_num_t)LCD_RST, LOW);   // Release reset
     delay(150);
     
     // Select LCD
@@ -516,9 +514,9 @@ static bool lcd_bb_init_and_test() {
     lcd_bb_cmd(ILI9341_PIXFMT);
     lcd_bb_data8(0x55);
     
-    // MADCTL: landscape
+    // MADCTL: landscape + mirror_x + mirror_y + BGR (from official BSP)
     lcd_bb_cmd(ILI9341_MADCTL);
-    lcd_bb_data8(0x28);
+    lcd_bb_data8(0xE8);  // MY|MX|MV|BGR
     
     // Inversion OFF
     lcd_bb_cmd(ILI9341_INVOFF);
@@ -578,7 +576,7 @@ static bool lcd_bb_init_and_test() {
     return true;
 }
 
-// SPI low-level communication via ESP-IDF (10MHz, SPI3_HOST)
+// SPI low-level communication via ESP-IDF (20MHz, SPI2_HOST)
 static void lcd_spi_init() {
     pinMode(LCD_CS, OUTPUT);
     pinMode(LCD_DC, OUTPUT);
@@ -593,7 +591,7 @@ static void lcd_spi_init() {
         .sclk_io_num = LCD_SCLK,       // GPIO7
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 320 * 2,   // Max transfer: 1 scanline (320px * 2 bytes)
+        .max_transfer_sz = 6400,      // Max transfer: width * 2 * 10 (from official BSP)
         .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK,
     };
     
@@ -606,7 +604,7 @@ static void lcd_spi_init() {
         .duty_cycle_pos = 128,              // 50% duty cycle
         .cs_ena_pretrans = 0,
         .cs_ena_posttrans = 1,              // Keep CS active 1 bit after xfer
-        .clock_speed_hz = 2 * 1000 * 1000, // 2MHz (slow for reliability)
+        .clock_speed_hz = 20 * 1000 * 1000, // 20MHz (official BSP value)
         .input_delay_ns = 0,
         .spics_io_num = LCD_CS,            // GPIO5
         .flags = 0,                    // No special flags (ILI9341 is full-duplex write only)
@@ -616,19 +614,19 @@ static void lcd_spi_init() {
     };
     
     esp_err_t err;
-    err = spi_bus_initialize(SPI3_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    err = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) {
         Serial.printf("[LCD] SPI bus init failed: %s\n", esp_err_to_name(err));
         return;
     }
     
-    err = spi_bus_add_device(SPI3_HOST, &dev_cfg, &lcd_spi);
+    err = spi_bus_add_device(SPI2_HOST, &dev_cfg, &lcd_spi);
     if (err != ESP_OK) {
         Serial.printf("[LCD] SPI device add failed: %s\n", esp_err_to_name(err));
         return;
     }
     
-    Serial.println("[LCD] ESP-IDF SPI3_HOST bus init OK");
+    Serial.println("[LCD] ESP-IDF SPI2_HOST bus init OK");
 }
 
 // Write command (1 byte, D/C=LOW)
@@ -672,12 +670,10 @@ static void lcd_set_addr(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
 
 // ILI9341 initialization sequence (standard + gamma from Adafruit)
 static void lcd_init_panel() {
-    // Hardware reset
-    digitalWrite(LCD_RST, HIGH);
+    // Hardware reset (reset_active_high=true from official BSP: HIGH=reset, LOW=run)
+    digitalWrite(LCD_RST, HIGH);  // Enter reset
     delay(10);
-    digitalWrite(LCD_RST, LOW);
-    delay(10);
-    digitalWrite(LCD_RST, HIGH);
+    digitalWrite(LCD_RST, LOW);   // Release reset
     delay(120);
 
     // Software reset
@@ -745,10 +741,10 @@ static void lcd_init_panel() {
     lcd_write_cmd(ILI9341_NORON);
     delay(10);
 
-    // Memory Access Control: Landscape rotation 1
-    // MADCTL: MV=1 (rotate), BGR=1 (0x08)
+    // Memory Access Control: Landscape + mirror_x + mirror_y + BGR (from official BSP)
+    // MY=1(bit7) MX=1(bit6) MV=1(bit5) BGR=1(bit3) = 0xE8
     lcd_write_cmd(ILI9341_MADCTL);
-    lcd_write_data8(0x28);  // MV=0x20 | BGR=0x08
+    lcd_write_data8(0xE8);  // MY|MX|MV|BGR
 
     // Display ON
     lcd_write_cmd(ILI9341_DISPON);
@@ -1029,7 +1025,7 @@ static void lcd_init() {
     Serial.println("[LCD] Backlight ON");
     
     // Step 2: SPI bus
-    Serial.println("[LCD] Init SPI bus (SPI3_HOST, 4MHz)...");
+    Serial.println("[LCD] Init SPI bus (SPI2_HOST, 20MHz)...");
     lcd_spi_init();
     delay(100);
     Serial.println("[LCD] SPI bus OK");
