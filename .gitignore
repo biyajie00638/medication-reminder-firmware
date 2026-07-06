@@ -1,3 +1,9 @@
 .pio/
-pio_home/
+.pioenvs/
 .vscode/
+*.bin
+*.elf
+*.o
+sdkconfig
+sdkconfig.old
+
