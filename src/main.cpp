@@ -1360,7 +1360,7 @@ static bool download_and_play_wav(const String& url) {
     Serial.printf("[HTTP] Downloading WAV: %s\n", url.c_str());
     
     HTTPClient http;
-    http.setTimeout(10000);
+    http.setTimeout(30000);
     http.setConnectTimeout(5000);
     
     if (!http.begin(url)) {
@@ -1384,9 +1384,13 @@ static bool download_and_play_wav(const String& url) {
         return false;
     }
     
-    uint8_t* buf = (uint8_t*)malloc(content_len);
+    // FIX: allocate download buffer from PSRAM, NOT internal RAM.
+    // A large internal-RAM malloc here fragments the heap and starves the
+    // WiFi driver of RX buffers, causing large downloads to stall at ~113KB.
+    // PSRAM (8MB on BOX-3) has plenty of headroom for a 178KB WAV.
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(content_len, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        Serial.println("[HTTP] Failed to allocate buffer");
+        Serial.println("[HTTP] Failed to allocate PSRAM buffer");
         http.end();
         return false;
     }
@@ -1395,10 +1399,11 @@ static bool download_and_play_wav(const String& url) {
     int total_read = 0;
     unsigned long start_ms = millis();
     
-    while (total_read < content_len && millis() - start_ms < 15000) {
+    while (total_read < content_len && millis() - start_ms < 30000) {
         int available = stream->available();
         if (available) {
             int read = stream->readBytes(buf + total_read, min(available, content_len - total_read));
+            if (read <= 0) break;   // connection closed / error
             total_read += read;
         } else {
             delay(10);
@@ -1464,16 +1469,19 @@ static void poll_medication_reminders() {
             if (!played && strlen(audio_url) > 0 && !was_played(id)) {
                 Serial.printf("[POLL] Playing reminder for: %s\n", med_name);
                 lcd_show_reminder(med_name);
-                download_and_play_wav(String(audio_url));
-                mark_as_played_local(id);
-                
-                // Mark as played on server
-                String mark_url = String(SERVER_BASE) + "/api/schedules/" +
-                                  id + "/played";
-                HTTPClient http2;
-                http2.begin(mark_url);
-                http2.PUT("");
-                http2.end();
+                bool play_ok = download_and_play_wav(String(audio_url));
+                if (play_ok) {
+                    mark_as_played_local(id);
+                    // Mark as played on server
+                    String mark_url = String(SERVER_BASE) + "/api/schedules/" +
+                                      id + "/played";
+                    HTTPClient http2;
+                    http2.begin(mark_url);
+                    http2.PUT("");
+                    http2.end();
+                } else {
+                    Serial.printf("[POLL] Playback failed for %s, will retry next poll\n", med_name);
+                }
             }
         }
     }
