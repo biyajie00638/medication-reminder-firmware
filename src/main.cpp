@@ -38,6 +38,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include "esp_heap_caps.h"
+#include "cjk_font.h"          // v7.70: CJK 16x16 dot-matrix font (GB2312+ASCII)
 
 // ============================================================
 // PIN DEFINITIONS - ESP-BOX-3 (CRITICAL: verified from schematic)
@@ -1214,7 +1215,7 @@ static void lcd_init() {
     Serial.println("[LCD] Init ILI9341 panel (BSP vendor init)...");
     lcd_init_panel();
 
-    Serial.println("[LCD] ILI9341 initialized! (v7.59: ES7210 full analog init + L/R auto channel select + L/R diag)");
+    Serial.println("[LCD] ILI9341 initialized! (v7.70: CJK Chinese font display for reminder screen)");
 }
 
 static void lcd_show_boot_screen() {
@@ -1229,7 +1230,7 @@ static void lcd_show_boot_screen() {
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_CYAN, LCD_BLACK);
     lcd_set_cursor(75, 120);   // "Firmware v7.21": 15 chars * 6px = 90, center: (240-90)/2 = 75
-    lcd_print("Firmware v7.67");
+    lcd_print("Firmware v7.70");
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
     lcd_set_cursor(75, 150);   // "Initializing...": 15 chars * 6px = 90, center: (240-90)/2 = 75
     lcd_print("Initializing...");
@@ -1341,6 +1342,147 @@ static void lcd_draw_text_fb(int16_t x, int16_t y, const char* str,
     }
 }
 
+// ============================================================
+// v7.70: CJK TEXT RENDERER (UTF-8 → cjk_font.h 16x16 dot-matrix)
+// Renders Chinese (GB2312) + ASCII + full-width punctuation using
+// the auto-generated cjk_font.h bitmap font. Framebuffer-based,
+// flicker-free, same blit strategy as lcd_draw_text_fb().
+// ============================================================
+
+// Decode one UTF-8 character from *p, return Unicode codepoint.
+// Advances *p past the character.
+static uint32_t utf8_decode_char(const char** p) {
+    const unsigned char* s = (const unsigned char*)*p;
+    uint32_t cp;
+    if (s[0] < 0x80) { cp = s[0]; *p += 1; return cp; }          // ASCII
+    if ((s[0] & 0xE0) == 0xC0 && s[1]) { cp=((s[0]&0x1F)<<6)|(s[1]&0x3F); *p+=2; return cp; } // 2-byte
+    if ((s[0] & 0xF0) == 0xE0 && s[1] && s[2]) { cp=((s[0]&0x0F)<<12)|((s[1]&0x3F)<<6)|(s[2]&0x3F); *p+=3; return cp; } // 3-byte
+    if ((s[0] & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) { /* 4-byte: surrogate */ cp=0xFFFD; *p+=4; return cp; }
+    cp = s[0]; *p += 1; return cp;  // fallback: treat as raw byte
+}
+
+// Measure width of a UTF-8 string in CJK cells at given scale.
+// Each cell is (CJK_GLYPH_W * scale) pixels wide.
+static int cjk_measure_width(const char* str, uint8_t scale) {
+    int w = 0;
+    const char* p = str;
+    while (*p) {
+        utf8_decode_char(&p);
+        w += CJK_GLYPH_W * scale;
+    }
+    return w;
+}
+
+// Render one glyph from cjk_font into a pixel buffer at (gx, gy).
+// fb_w = framebuffer stride (pixels per row).
+static void render_cjk_glyph(uint16_t* fb, int fb_w, int gx, int gy,
+                              uint8_t scale, uint32_t cp,
+                              uint16_t fg_color, uint16_t bg_color) {
+    int idx = cjk_find_glyph(cp);
+    if (idx < 0) {
+        // Character not in font — draw small box outline as fallback
+        int cw = CJK_GLYPH_W * scale;
+        int ch = CJK_GLYPH_H * scale;
+        for (int dy = 0; dy < ch; dy++) for (int dx = 0; dx < cw; dx++) {
+            if (dx == 0 || dy == 0 || dx == cw-1 || dy == ch-1)
+                fb[(gy+dy)*fb_w + gx+dx] = fg_color;
+            else
+                fb[(gy+dy)*fb_w + gx+dx] = bg_color;
+        }
+        return;
+    }
+    // Read glyph bytes from PROGMEM and paint scaled pixels
+    for (int r = 0; r < CJK_GLYPH_H; r++) {
+        uint8_t hi = pgm_read_byte(&cjk_glyphs[idx * CJK_GLYPH_BYTES + r * 2]);
+        uint8_t lo = pgm_read_byte(&cjk_glyphs[idx * CJK_GLYPH_BYTES + r * 2 + 1]);
+        uint16_t rowbits = ((uint16_t)hi << 8) | lo;
+        for (int c = 0; c < CJK_GLYPH_W; c++) {
+            uint16_t pix = (rowbits & (1 << (15 - c))) ? fg_color : bg_color;
+            for (int dy = 0; dy < scale; dy++) {
+                for (int dx = 0; dx < scale; dx++) {
+                    fb[(gy + r*scale + dy) * fb_w + (gx + c*scale + dx)] = pix;
+                }
+            }
+        }
+    }
+}
+
+// Draw CJK text with flicker-free framebuffer rendering.
+// Returns total pixels drawn horizontally.
+// Supports word-wrap at max_width (-1 = no wrap).
+static void lcd_draw_cjk_fb(int16_t x, int16_t y, const char* str,
+                             uint8_t scale, uint16_t fg_color, uint16_t bg_color,
+                             int max_width = -1) {
+    if (!str || !*str) return;
+
+    int cell_w = CJK_GLYPH_W * scale;
+    int cell_h = CJK_GLYPH_H * scale;
+    int pad_y   = 4;  // vertical padding
+
+    // Measure: count chars, compute total dimensions with wrap
+    int num_chars = 0;
+    const char* p = str;
+    while (*p) { utf8_decode_char(&p); num_chars++; }
+
+    int line_w = 0, max_line_w = 0, lines = 1;
+    p = str;
+    while (*p) {
+        utf8_decode_char(&p);
+        line_w += cell_w;
+        if (max_width > 0 && line_w - cell_w <= max_width && line_w > max_width) {
+            line_w = cell_w;
+            lines++;
+        }
+        if (line_w > max_line_w) max_line_w = line_w;
+        if (max_width > 0 && max_line_w > max_width) max_line_w = max_width;
+    }
+
+    // Clamp to screen width
+    if (max_line_w > _lcd_w) max_line_w = _lcd_w;
+
+    int fb_w   = max_line_w;
+    int fb_h   = lines * cell_h + pad_y * (lines > 1 ? lines : 2);
+    if (fb_h > _lcd_h) fb_h = _lcd_h;
+
+    // Static framebuffer in SRAM (worst case: ~24 chars × 32px wide × 36px tall ≈ 31KB)
+    static uint16_t cjk_fb[240 * 50];       // max 240×50 = 24KB
+    static uint8_t  cjk_row_bytes[240 * 2]; // SPI row buffer
+
+    // Clear to background
+    for (int i = 0; i < fb_w * fb_h; i++) cjk_fb[i] = bg_color;
+
+    // Second pass: render glyphs
+    p = str;
+    int cx = 0, cy = pad_y / 2;
+    while (*p) {
+        uint32_t cp = utf8_decode_char(&p);
+
+        // Word wrap
+        if (max_width > 0 && cx + cell_w > max_width) {
+            cx = 0;
+            cy += cell_h + 2;  // 2px inter-line gap
+        }
+
+        render_cjk_glyph(cjk_fb, fb_w, cx, cy, scale, cp, fg_color, bg_color);
+        cx += cell_w;
+    }
+
+    // Blit framebuffer to LCD row-by-row (one SPI transaction per row)
+    lcd_set_addr(x, y, x + fb_w - 1, y + fb_h - 1);
+    for (int row = 0; row < fb_h; row++) {
+        for (int col = 0; col < fb_w; col++) {
+            uint16_t c = cjk_fb[row * fb_w + col];
+            cjk_row_bytes[col * 2]     = (uint8_t)(c >> 8);
+            cjk_row_bytes[col * 2 + 1] = (uint8_t)(c & 0xFF);
+        }
+        spi_transaction_t t = {};
+        t.length    = fb_w * 2 * 8;
+        t.tx_buffer = cjk_row_bytes;
+        t.user      = (void*)1;  // D/C = HIGH
+        spi_device_transmit(lcd_spi, &t);
+    }
+}
+
 static void lcd_show_time() {
     struct tm timeinfo;
     bool has_time = getLocalTime(&timeinfo);
@@ -1374,37 +1516,46 @@ static void restore_main_screen() {
 }
 
 static void lcd_show_reminder(const char* med_name, const char* dosage) {
+    // v7.70: Full Chinese reminder screen using CJK bitmap font.
+    // Layout (portrait 240x320):
+    //   y=8:    "⚠ 服药提醒 ⚠"       scale=1 red
+    //   y=48:   [药名]                scale=2 yellow (centered, auto-wrap)
+    //   y=112:  "用量：[剂量]"         scale=2 white  (centered)
+    //   y=176:  "请按时服用！"          scale=2 cyan  (centered)
+    //   y=228:  "正在播放语音..."      scale=1 green (centered)
+
     lcd_fill_screen(LCD_BLACK);
-    lcd_set_text_size(2);
-    lcd_set_text_color(LCD_RED, LCD_BLACK);
-    lcd_set_cursor(24, 30);  // "!! MEDICATION !!": 16 chars * 12px = 192, center: (240-192)/2=24
-    lcd_print("!! MEDICATION !!");
 
-    lcd_set_text_size(3);
-    lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
-    lcd_set_cursor(20, 75);   // med name: approx center, max ~10 chars * 18px = 180px
-    char buf[22];
-    strncpy(buf, med_name, 21);
-    buf[21] = '\0';
-    lcd_print(buf);
+    // Title line — "⚠ 服药提醒 ⚠" (scale 1, 16px tall)
+    const char* title = "\xE2\x9A\xA0 \E6\x9C\x8D\xE8\x8D\xAF\xE6\x8F\x90\xE9\x86\x92 \xE2\x9A\xA0";  // UTF-8: "⚠ 服药提醒 ⚠"
+    int tw = cjk_measure_width(title, 1);
+    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 8, title, 1, LCD_RED, LCD_BLACK);
 
-    // 剂量（新增：屏幕显示药物用量）
-    lcd_set_text_size(2);
-    lcd_set_text_color(LCD_WHITE, LCD_BLACK);
-    lcd_set_cursor(20, 112);  // "用量：XXX": below med name
-    char dbuf[48];
-    sprintf(dbuf, "用量：%s", (dosage && strlen(dosage) > 0) ? dosage : "未指定");
-    lcd_print(dbuf);
+    // Med name — big, scale 2 (32px), auto-wrap if too wide
+    int mnw = cjk_measure_width(med_name ? med_name : "", 2);
+    int mnx = (mnw < _lcd_w) ? (_lcd_w - mnw) / 2 : 4;  // center or left-align with margin
+    lcd_draw_cjk_fb(mnx, 48, med_name ? med_name : "(未命名)", 2,
+                    LCD_YELLOW, LCD_BLACK, _lcd_w - 8);
 
-    lcd_set_text_size(2);
-    lcd_set_text_color(LCD_WHITE, LCD_BLACK);
-    lcd_set_cursor(66, 150);  // "TAKE NOW!": 9 chars * 12px = 108, center: (240-108)/2=66
-    lcd_print("TAKE NOW!");
+    // Dosage — scale 2
+    char dbuf[64];
+    snprintf(dbuf, sizeof(dbuf), "\xE7\x94\xA8\xE9\x87\x8F\xEF\xBC\x9A%s",
+             (dosage && strlen(dosage) > 0) ? dosage : "\xE6\x9C\xAA\xE6\x8C\x87\xE5\xAE\x9A");
+    // UTF-8: "用量：" + value / "未指定"
+    int dsw = cjk_measure_width(dbuf, 2);
+    lcd_draw_cjk_fb((_lcd_w - dsw) / 2, 112, dbuf, 2, LCD_WHITE, LCD_BLACK);
 
-    lcd_set_text_size(1);
-    lcd_set_text_color(LCD_GREEN, LCD_BLACK);
-    lcd_set_cursor(66, 185);  // "Playing reminder...": 18 chars * 6px = 108, center: (240-108)/2=66
-    lcd_print("Playing reminder...");
+    // Action prompt — "请按时服用！" scale 2
+    const char* action = "\xE8\xAF\xB7\xE6\x8C\x89\xE6\x97\xB6\xE6\x9C\x8D\xE7\x94\xA8\xEF\xBC\x81";
+    // UTF-8: "请按时服用！"
+    int aw = cjk_measure_width(action, 2);
+    lcd_draw_cjk_fb((_lcd_w - aw) / 2, 176, action, 2, LCD_CYAN, LCD_BLACK);
+
+    // Status — "正在播放语音..." scale 1
+    const char* status = "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x92\xAD\xE6\x94\xBE\xE8\xAF\xAD\xE9\x9F\xB3...";
+    // UTF-8: "正在播放语音..."
+    int sw = cjk_measure_width(status, 1);
+    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 228, status, 1, LCD_GREEN, LCD_BLACK);
 }
 
 // ============================================================
@@ -1869,7 +2020,7 @@ void setup() {
     
     Serial.println("\n\n====================================");
     Serial.println("  Medication Reminder - ESP-BOX-3");
-    Serial.println("  Firmware v7.67 (ROOT-CAUSE FIX for all-zero capture: MCLK now APLL-derived EXACT 4.096MHz (use_apll=true, fixed_mclk=4096000). ES7210 internal PLL would not lock on the imprecise PLL_D2 clock used when use_apll=false -> ANALOG(0x40) bit7 (PLL-lock status) stayed 0 -> ADC silent. Standard I2S 2-slot, MIC1=LEFT)");
+    Serial.println("  Firmware v7.70 (CJK display: GB2312 16x16 dot-matrix font via auto-generated cjk_font.h from simhei.ttf; reminder screen now shows Chinese medication name + dosage. Builds on v7.67 MCLK APLL fix.)");
     Serial.println("====================================\n");
 
     // ---- Step 0: Initialize LCD ----
