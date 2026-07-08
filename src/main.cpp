@@ -32,7 +32,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <driver/i2s.h>
+#include <driver/i2s.h>          // Legacy ESP-IDF I2S driver (only one available in this toolchain)
 #include <driver/spi_master.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
@@ -68,8 +68,12 @@
 // AUDIO CONFIG
 // ============================================================
 #define SAMPLE_RATE     16000
-#define I2S_PORT_TX     I2S_NUM_0   // TX master (ES8311 speaker)
-#define I2S_PORT_RX     I2S_NUM_1   // RX slave  (ES7210 microphone)
+// I2S uses the legacy ESP-IDF driver on a SINGLE I2S0 peripheral, configured in
+// TDM 4-slot mode (whole-peripheral). ES7210 (mic) outputs MIC1..4 on slots 0..3;
+// ES8311 (speaker) shares the same BCLK/WS and plays slot0=LEFT, slot1=RIGHT.
+// TTS is mono (L==R) so the shared framing is inaudible.
+static i2s_port_t i2s_port = I2S_NUM_0;
+#define I2S_RX_ENABLED  1           // 1 = full-duplex mic (ES7210 RX on same I2S0 as ES8311 TX)
 #define I2S_BITS        16
 
 // ============================================================
@@ -91,6 +95,8 @@
 #define SERVER_BASE     "http://YOUR_SERVER_IP:3000"
 #define DEVICE_MAC     "e8:f6:0a:a8:c3:bc"
 #define POLL_INTERVAL   60000   // 60s polling interval
+#define REMINDER_REPEAT 5       // 同一条提醒连播次数
+#define REMINDER_REPEAT_INTERVAL_MS 1000  // 连播间隔(毫秒)
 
 // ============================================================
 // VOLUME (0-100)
@@ -128,14 +134,15 @@ static int es8311_read_reg(uint8_t reg) {
 // espressif/es8311 driver + ES8316 Linux driver reference)
 // ============================================================
 static bool es8311_init_codec() {
-    Serial.println("[ES8311] Starting initialization...");
-    
+    Serial.println("[ES8311] Starting initialization (v3.3 EXACT known-good sequence)...");
+    delay(300);   // v7.62: cold-boot fix — wait for ES8311 to power up & be I2C-ready
+
     bool ok = true;
-    
+
     // Reset chip first
     ok &= es8311_write_reg(0x45, 0x00);   // Reset
     delay(50);                               // Wait for reset
-    
+
     // ---- Clock & System Setup ----
     ok &= es8311_write_reg(0x01, 0x30);   // SYSTEM: CLK_MANAGER=1, ANALOG=0 (will enable later)
     ok &= es8311_write_reg(0x02, 0x10);   // CLK: MCLK=0, BCLK divider
@@ -146,15 +153,14 @@ static bool es8311_init_codec() {
     ok &= es8311_write_reg(0x05, 0x00);   // CLK: ADC OSR
     ok &= es8311_write_reg(0x0B, 0x00);   // CLK: DSP config
     ok &= es8311_write_reg(0x0C, 0x00);   // CLK: ADC HPF
-    
+
     // ---- Digital Power Supply Voltage Level ----
     ok &= es8311_write_reg(0x10, 0x1F);   // DIG_PDN: VDD=3.3V (matches ESP-BOX-3)
     ok &= es8311_write_reg(0x11, 0x7F);   // DIG_PDN: VDD=3.3V
-    
-    // ---- I2S Config ----
+
     ok &= es8311_write_reg(0x00, 0x80);   // CHIP_STA: Slave mode (bit7=0, bit6=ADC, bit5=DAC)
     // 0x80 = slave mode, ADC from I2S, DAC from I2S
-    
+
     // ---- ADC Config ----
     ok &= es8311_write_reg(0x0D, 0x01);   // ADC: ramp rate
     ok &= es8311_write_reg(0x0E, 0x02);   // ADC: input selection (MIC1P/MIC1N)
@@ -162,41 +168,38 @@ static bool es8311_init_codec() {
     ok &= es8311_write_reg(0x15, 0x00);   // ADC: ALC config
     ok &= es8311_write_reg(0x1B, 0x0A);   // ADC: EQ/filter config
     ok &= es8311_write_reg(0x1C, 0x6A);   // ADC: EQ/filter config
-    
+
     // ---- DAC Config ----
     ok &= es8311_write_reg(0x12, 0x00);   // DAC: config
     ok &= es8311_write_reg(0x13, 0x00);   // DAC: ramp rate
     ok &= es8311_write_reg(0x14, 0x10);   // DAC: soft mute off, DAC stereo
-    
+
     // ---- I2S Format ----
     ok &= es8311_write_reg(0x09, 0x0C);   // I2S: 16-bit, I2S format
     ok &= es8311_write_reg(0x0A, 0x0C);   // I2S: 16-bit, I2S format
-    
+
     // ---- Enable System ----
     ok &= es8311_write_reg(0x01, 0x3F);   // SYSTEM: CLK_MANAGER=1, ANALOG=1, ADC=1, DAC=1
-    
+
     // ---- Volume ----
-    // DAC volume: 0x00 = -95.5dB, 0xBF = 0dB, 0xFF = +31.5dB
-    // For VOLUME=80 (out of 100), map to register value
+    // ES8311 DAC digital volume register (this chip uses 0x32; v3.3 was
+    // confirmed audible with this register). 0x00 = -95.5dB (mute),
+    // 0xBF = 0dB, 0xFF = +31.5dB.
     uint8_t dac_vol = (uint8_t)((VOLUME * 0xBF) / 100);
-    ok &= es8311_write_reg(0x32, dac_vol); // DAC volume
-    
+    ok &= es8311_write_reg(0x32, dac_vol); // DAC volume (v3.3 exact)
+
     // ADC volume
     ok &= es8311_write_reg(0x17, 0xBF);   // ADC volume: 0dB
-    
-    // ---- ADC Input (disable mic for speaker-only) ----
-    // Register 0x0E already set above for mic input; for speaker only,
-    // we just need DAC output path working
-    
+
     // ---- Loopback OFF (important!) ----
     ok &= es8311_write_reg(0x44, 0x00);   // Loopback off
     ok &= es8311_write_reg(0x37, 0x08);   // Additional config
-    
+
     if (!ok) {
         Serial.println("[ES8311] ERROR: Some register writes failed!");
         return false;
     }
-    
+
     // Verify communication by reading back a register
     int ver = es8311_read_reg(0x00);
     if (ver < 0) {
@@ -204,7 +207,7 @@ static bool es8311_init_codec() {
         return false;
     }
     Serial.printf("[ES8311] Register 0x00 = 0x%02X (expected 0x80)\n", ver);
-    
+
     Serial.println("[ES8311] Initialization complete!");
     return true;
 }
@@ -212,33 +215,38 @@ static bool es8311_init_codec() {
 // ============================================================
 // ES7210 Register Definitions (from esp-bsp/es7210_reg.h)
 // ============================================================
+// ES7210 Register Definitions — CORRECTED to match ESPHome/esp-adf verified mapping
 #define ES7210_RESET_REG00              0x00
 #define ES7210_CLOCK_OFF_REG01          0x01
-#define ES7210_DOUBLE_REG02             0x02
-#define ES7210_SR_REG03                 0x03
-#define ES7210_MODE_CONFIG_REG08        0x08
-#define ES7210_ADC_OSR_REG04            0x04
-#define ES7210_ADC1_OFFSET_REG06        0x06
-#define ES7210_ADC2_OFFSET_REG07        0x07
+#define ES7210_MAINCLK_REG02            0x02
+#define ES7210_MASTER_CLK_REG03         0x03
+#define ES7210_LRCK_DIVH_REG04          0x04
+#define ES7210_LRCK_DIVL_REG05          0x05
 #define ES7210_POWER_DOWN_REG06         0x06
-#define ES7210_REG09                    0x09
-#define ES7210_REG0A                    0x0A
-#define ES7210_ADC12_HPF1_REG23         0x23
-#define ES7210_ADC12_HPF2_REG22         0x22
-#define ES7210_ADC34_HPF1_REG21         0x21
-#define ES7210_ADC34_HPF2_REG20         0x20
-#define ES7210_MIC12_POWER_REG4B        0x4B
-#define ES7210_MIC34_POWER_REG4C        0x4C
-#define ES7210_MIC1_GAIN_REG44          0x44
-#define ES7210_MIC2_GAIN_REG45          0x45
-#define ES7210_MIC3_GAIN_REG46          0x46
-#define ES7210_MIC4_GAIN_REG47          0x47
-#define ES7210_MAINCLK_REG0D            0x0D
-#define ES7210_CLK_DET_REG0E            0x0E
+#define ES7210_OSR_REG07                0x07
+#define ES7210_MODE_CONFIG_REG08        0x08
+#define ES7210_TIME_CONTROL0_REG09      0x09
+#define ES7210_TIME_CONTROL1_REG0A      0x0A
 #define ES7210_SDP_INTERFACE1_REG11     0x11
 #define ES7210_SDP_INTERFACE2_REG12     0x12
+#define ES7210_ADC34_HPF2_REG20         0x20
+#define ES7210_ADC34_HPF1_REG21         0x21
+#define ES7210_ADC12_HPF1_REG22         0x22
+#define ES7210_ADC12_HPF2_REG23         0x23
 #define ES7210_ANALOG_REG40             0x40
-#define ES7210_MICBIAS_REG41            0x41
+#define ES7210_MIC12_BIAS_REG41         0x41
+#define ES7210_MIC34_BIAS_REG42         0x42
+#define ES7210_MIC1_GAIN_REG43          0x43
+#define ES7210_MIC2_GAIN_REG44          0x44
+#define ES7210_MIC3_GAIN_REG45          0x45
+#define ES7210_MIC4_GAIN_REG46          0x46
+#define ES7210_MIC1_POWER_REG47         0x47
+#define ES7210_MIC2_POWER_REG48         0x48
+#define ES7210_MIC3_POWER_REG49         0x49
+#define ES7210_MIC4_POWER_REG4A         0x4A
+#define ES7210_MIC12_POWER_REG4B        0x4B
+#define ES7210_MIC34_POWER_REG4C        0x4C
+#define ES7210_CLK_DET_REG0E            0x0E
 
 // ES7210 I2C helpers
 static bool es7210_write_reg(uint8_t reg, uint8_t val) {
@@ -266,87 +274,127 @@ static int es7210_read_reg(uint8_t reg) {
 // KEY FIXES from v5.x-v6.x debugging:
 //   - CLOCK_OFF_REG01 = 0x3F (safe static state during config)
 //   - POWER_DOWN_REG06 = 0x04 (DLL bypass power-down, per ESPHome)
-//   - SDP_INTERFACE2_REG12 = 0x00 (standard I2S, NOT TDM)
+//   - SDP_INTERFACE2_REG12 = 0x00 (standard I2S 2-ch: MIC1=LEFT / MIC2=RIGHT on SDOUT1)
 //   - MODE_CONFIG_REG08 = 0x10 (2ch standard slave)
 // ============================================================
 static bool es7210_init_codec() {
-    Serial.println("[ES7210] Starting initialization...");
+    Serial.println("[ES7210] Initializing (ESPHome-verified sequence, v7.60)...");
     bool ok = true;
 
-    // Step 1: Reset
+    // 1. Reset
     ok &= es7210_write_reg(ES7210_RESET_REG00, 0xFF);
-    delay(30);
+    delay(120);  // v7.62: cold-boot fix — longer reset settle
     ok &= es7210_write_reg(ES7210_RESET_REG00, 0x32);
-    delay(10);
+    ok &= es7210_write_reg(ES7210_CLOCK_OFF_REG01, 0x3F);  // clock off during config
 
-    // Step 1b: Close all clocks during config (safe static state)
-    ok &= es7210_write_reg(ES7210_CLOCK_OFF_REG01, 0x3F);
+    // 2. Time control (chip init / power-up periods)
+    ok &= es7210_write_reg(ES7210_TIME_CONTROL0_REG09, 0x30);
+    ok &= es7210_write_reg(ES7210_TIME_CONTROL1_REG0A, 0x30);
 
-    // Step 2: Set initialization time
-    ok &= es7210_write_reg(0x04, 0x01);
-    ok &= es7210_write_reg(0x05, 0x00);
-    ok &= es7210_write_reg(0x06, 0x01);
-    ok &= es7210_write_reg(0x07, 0x00);
-
-    // Step 3: HPF config
-    ok &= es7210_write_reg(ES7210_ADC12_HPF2_REG22, 0x2A);
-    ok &= es7210_write_reg(ES7210_ADC12_HPF1_REG23, 0x0A);
+    // 3. HPF for all ADC channels
+    ok &= es7210_write_reg(ES7210_ADC12_HPF2_REG23, 0x2A);
+    ok &= es7210_write_reg(ES7210_ADC12_HPF1_REG22, 0x0A);
     ok &= es7210_write_reg(ES7210_ADC34_HPF2_REG20, 0x0A);
     ok &= es7210_write_reg(ES7210_ADC34_HPF1_REG21, 0x2A);
 
-    // Step 4: I2S format - 16-bit standard stereo (NOT TDM!)
-    ok &= es7210_write_reg(ES7210_SDP_INTERFACE1_REG11, 0x60);  // 16-bit, ADC1/2 on SDOUT1
-    ok &= es7210_write_reg(ES7210_SDP_INTERFACE2_REG12, 0x00);  // Standard I2S mode
+    // 4. Mode: I2S SLAVE (clear bit0; ESP32 I2S0 is master)
+    {
+        int rv = es7210_read_reg(ES7210_MODE_CONFIG_REG08);
+        uint8_t v = (rv < 0) ? 0 : (uint8_t)rv;
+        v &= (uint8_t)(~0x01);   // slave
+        ok &= es7210_write_reg(ES7210_MODE_CONFIG_REG08, v);
+    }
 
-    // Step 5: Mode config - 2ch standard, slave
-    ok &= es7210_write_reg(ES7210_MODE_CONFIG_REG08, 0x10);
+    // 5. Analog power + VMID + MICBIAS (0xC3: ESPHome proven-good value).
+    //    Bits 6/7 of 0x40 enable MICBIAS power; 0x3C (bits 6/7 = 0) DISABLES mic bias
+    //    -> electret mic gets no bias voltage -> all-zero (silent) recording.
+    ok &= es7210_write_reg(ES7210_ANALOG_REG40, 0xC3);
 
-    // Step 6: Analog power
-    ok &= es7210_write_reg(ES7210_ANALOG_REG40, 0x43);
-    ok &= es7210_write_reg(ES7210_MICBIAS_REG41, 0x00);
+    // 6. MIC bias (AVDD)
+    ok &= es7210_write_reg(ES7210_MIC12_BIAS_REG41, 0x70);
+    ok &= es7210_write_reg(ES7210_MIC34_BIAS_REG42, 0x70);
 
-    // Step 7: MIC bias and power
-    ok &= es7210_write_reg(ES7210_MIC12_POWER_REG4B, 0x00);
-    ok &= es7210_write_reg(ES7210_MIC34_POWER_REG4C, 0x00);
+    // 7. I2S format: 16-bit, standard I2S, MIC1=LEFT / MIC2=RIGHT on SDOUT1.
+    //    Use STANDARD I2S (SDP2=0x00) instead of TDM: the ESP32 legacy I2S reader
+    //    in TDM mode could not align WS to ES7210's TDM frame-sync, yielding all-zero.
+    //    Standard I2S 2-slot is the simplest, proven path (matches ESPHome default) and
+    //    is also consistent with ES8311 playback on the shared I2S0.
+    ok &= es7210_write_reg(ES7210_SDP_INTERFACE1_REG11, 0x60);
+    ok &= es7210_write_reg(ES7210_SDP_INTERFACE2_REG12, 0x00);  // standard I2S 2-ch (MIC1=LEFT, MIC2=RIGHT)
 
-    // Step 8: MIC1 gain (0x00=0dB, 0x01=3dB, ... max 0x0A=30dB)
-    ok &= es7210_write_reg(ES7210_MIC1_GAIN_REG44, 0x01);  // 3dB
-    ok &= es7210_write_reg(ES7210_MIC2_GAIN_REG45, 0x01);
+    // 8. Sample rate 16kHz @ MCLK=4.096MHz (ESPHome coefficient: mclk=4096000, lrclk=16000)
+    //    MAINCLK(0x02) = adc_div(0x01) | doubler<<6(0x40) | dll<<7(0x80) = 0xC1
+    ok &= es7210_write_reg(ES7210_MAINCLK_REG02, 0xC1);
+    ok &= es7210_write_reg(ES7210_OSR_REG07, 0x20);          // OSR
+    ok &= es7210_write_reg(ES7210_LRCK_DIVH_REG04, 0x01);    // LRCK high
+    ok &= es7210_write_reg(ES7210_LRCK_DIVL_REG05, 0x00);    // LRCK low
+    // NOTE: MASTER_CLK (0x03) is intentionally NOT written — ESPHome does not write
+    // it either; leaving the chip's reset default (MCLK from MCLK pin) avoids
+    // accidentally disabling the master clock input.
 
-    // Step 9: Main clock - 0xC1 for 16kHz with MCLK=4.096MHz, DLL bypass
-    ok &= es7210_write_reg(ES7210_MAINCLK_REG0D, 0xC1);
-    ok &= es7210_write_reg(ES7210_CLK_DET_REG0E, 0x00);
+    // 9. MIC gain (30dB): 0x10 = PGA enable, 0x0A = 30dB (official Espressif reference)
+    uint8_t gain = 0x1A;
+    ok &= es7210_write_reg(ES7210_MIC1_GAIN_REG43, gain);
+    ok &= es7210_write_reg(ES7210_MIC2_GAIN_REG44, gain);
+    ok &= es7210_write_reg(ES7210_MIC3_GAIN_REG45, gain);
+    ok &= es7210_write_reg(ES7210_MIC4_GAIN_REG46, gain);
 
-    // Step 10: SR_REG03 - 16kHz
-    ok &= es7210_write_reg(ES7210_SR_REG03, 0x00);
+    // 10. Power on MIC1-4
+    ok &= es7210_write_reg(ES7210_MIC1_POWER_REG47, 0x08);
+    ok &= es7210_write_reg(ES7210_MIC2_POWER_REG48, 0x08);
+    ok &= es7210_write_reg(ES7210_MIC3_POWER_REG49, 0x08);
+    ok &= es7210_write_reg(ES7210_MIC4_POWER_REG4A, 0x08);
 
-    // Step 11: Power down DLL (DLL_BYPASS=1 in MAINCLK, so power it down)
-    // ESPHome writes 0x04 here. 0x00 would keep DLL powered but it's bypassed.
+    // 11. Power down DLL (ESPHome: 0x04; DLL is bypassed via MAINCLK 0xC1 dll bit)
     ok &= es7210_write_reg(ES7210_POWER_DOWN_REG06, 0x04);
+
+    // 12. MIC1/2/3/4 bias + ADC + PGA power
+    ok &= es7210_write_reg(ES7210_MIC12_POWER_REG4B, 0x0F);
+    ok &= es7210_write_reg(ES7210_MIC34_POWER_REG4C, 0x0F);
+
+    // 13. Enable device (ESPHome final enable sequence)
+    ok &= es7210_write_reg(ES7210_RESET_REG00, 0x71);
+    ok &= es7210_write_reg(ES7210_RESET_REG00, 0x41);
+    // Enable clocks: clear the clock-off bits (ESPHome clears bit0/1/3 -> 0x3F & ~0x0B = 0x34)
+    ok &= es7210_write_reg(ES7210_CLOCK_OFF_REG01, 0x34);
 
     if (!ok) {
         Serial.println("[ES7210] ERROR: Some register writes failed!");
         return false;
     }
 
-    // Verify key registers
-    Serial.println("[ES7210] Register verification:");
-    Serial.printf("  RESET(0x00)     = 0x%02X (expect 0x32)\n", es7210_read_reg(0x00));
-    Serial.printf("  CLOCK_OFF(0x01) = 0x%02X (expect 0x3F)\n", es7210_read_reg(0x01));
-    Serial.printf("  PWR_DN(0x06)    = 0x%02X (expect 0x04)\n", es7210_read_reg(0x06));
-    Serial.printf("  MODE_CFG(0x08)  = 0x%02X (expect 0x10)\n", es7210_read_reg(0x08));
-    Serial.printf("  SDP1(0x11)      = 0x%02X (expect 0x60)\n", es7210_read_reg(0x11));
-    Serial.printf("  SDP2(0x12)      = 0x%02X (expect 0x00)\n", es7210_read_reg(0x12));
-    Serial.printf("  MAINCLK(0x0D)   = 0x%02X (expect 0xC1)\n", es7210_read_reg(0x0D));
+    // ---- v7.66 Post-init readback diagnostics: confirm I2C writes actually applied ----
+    int rb_reset = es7210_read_reg(ES7210_RESET_REG00);
+    int rb_clk   = es7210_read_reg(ES7210_CLOCK_OFF_REG01);
+    int rb_main  = es7210_read_reg(ES7210_MAINCLK_REG02);
+    int rb_gain  = es7210_read_reg(ES7210_MIC1_GAIN_REG43);
+    int rb_sdp1  = es7210_read_reg(ES7210_SDP_INTERFACE1_REG11);
+    int rb_sdp2  = es7210_read_reg(ES7210_SDP_INTERFACE2_REG12);
+    int rb_analog= es7210_read_reg(ES7210_ANALOG_REG40);
+    int rb_pd    = es7210_read_reg(ES7210_POWER_DOWN_REG06);
+    Serial.printf("[ES7210] READBACK: RESET(0x00)=0x%02X(exp 0x41) CLOCK_OFF(0x01)=0x%02X(exp 0x34) MAINCLK(0x02)=0x%02X(exp 0xC1) MIC1_GAIN(0x43)=0x%02X(exp 0x1A) ANALOG(0x40)=0x%02X(exp 0xC3) POWER_DOWN(0x06)=0x%02X(exp 0x04) SDP1(0x11)=0x%02X(exp 0x60) SDP2(0x12)=0x%02X(exp 0x00)\n",
+                  rb_reset<0?-1:rb_reset, rb_clk<0?-1:rb_clk, rb_main<0?-1:rb_main,
+                  rb_gain<0?-1:rb_gain, rb_analog<0?-1:rb_analog, rb_pd<0?-1:rb_pd, rb_sdp1<0?-1:rb_sdp1, rb_sdp2<0?-1:rb_sdp2);
+
+    // Full register dump 0x00..0x4F for deep diagnosis (if capture stays all-zero)
+    Serial.print("[ES7210] DUMP: ");
+    for (int a = 0x00; a <= 0x4F; a++) {
+        int v = es7210_read_reg(a);
+        if (v < 0) { Serial.print("?? "); }
+        else { Serial.printf("%02X:%02X ", a, v); }
+        if ((a & 0x0F) == 0x0F) Serial.print("\n        ");
+    }
+    Serial.println();
 
     Serial.println("[ES7210] Initialization complete!");
     return true;
 }
 
 // ============================================================
-// I2S Dual-Port Initialization
-// I2S_NUM_0 (TX Master): generates BCLK/WS/MCLK for ES8311 + ES7210
-// I2S_NUM_1 (RX Slave):  reads ES7210 data using clock from I2S0
+// I2S Single Full-Duplex Initialization (ESP32-S3-BOX-3 reference design)
+// I2S_NUM_0 (Master, TX+RX): generates BCLK/WS/MCLK for ES8311 + ES7210
+//   - TX (DOUT) -> ES8311 speaker DAC
+//   - RX (DIN)  <- ES7210 microphone ADC
 // ============================================================
 
 // TX silence task - keeps I2S0 clock running continuously
@@ -366,7 +414,7 @@ static void tx_silence_task(void* param) {
     Serial.println("[TX-SILENCE] Task started, keeping I2S clock alive...");
     while (tx_silence_active) {
         size_t bytes_written = 0;
-        esp_err_t err = i2s_write(I2S_PORT_TX, silence_buf, buf_bytes,
+        esp_err_t err = i2s_write(i2s_port, silence_buf, buf_bytes,
                                    &bytes_written, pdMS_TO_TICKS(50));
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
             Serial.printf("[TX-SILENCE] i2s_write error: %s\n", esp_err_to_name(err));
@@ -390,95 +438,83 @@ static void tx_silence_resume() {
     }
 }
 
+// ============================================================
+// I2S initialization (v3.3 proven audio architecture: single I2S0,
+// MASTER | TX | RX full-duplex, drives BCLK/WS/MCLK out; ES8311 + ES7210 slave).
+// NOTE: Do NOT add a PCNT BCLK measurement at boot -- pcnt_unit_config()
+// forces GPIO17 to INPUT and HALTS the I2S bit-clock; it does NOT auto-
+// resume, which silently kills all audio. (Lesson learned the hard way.)
+// ============================================================
 static bool i2s_init_driver() {
-    Serial.println("[I2S] Initializing dual-port (I2S0 TX master + I2S1 RX slave)...");
-    
-    // ---- I2S0: TX Master (ES8311 speaker) ----
-    i2s_config_t i2s_tx_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 1024,
-        .use_apll = true,
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 4096000
-    };
-    
-    i2s_pin_config_t tx_pin_config = {
-        .mck_io_num = I2S_MCLK,
-        .bck_io_num = I2S_BCLK,
-        .ws_io_num = I2S_WS,
-        .data_out_num = I2S_DOUT,
-        .data_in_num = -1  // TX only
-    };
-    
+    Serial.println("[I2S] Initializing SINGLE full-duplex I2S0 (TX->ES8311, RX<-ES7210, master clock)...");
+
     esp_err_t err;
-    err = i2s_driver_install(I2S_PORT_TX, &i2s_tx_config, 0, NULL);
-    if (err != ESP_OK) {
-        Serial.printf("[I2S] TX driver install failed: %s\n", esp_err_to_name(err));
-        return false;
-    }
-    err = i2s_set_pin(I2S_PORT_TX, &tx_pin_config);
-    if (err != ESP_OK) {
-        Serial.printf("[I2S] TX set pin failed: %s\n", esp_err_to_name(err));
-        return false;
-    }
-    err = i2s_start(I2S_PORT_TX);
-    if (err != ESP_OK) {
-        Serial.printf("[I2S] TX start failed: %s\n", esp_err_to_name(err));
-        return false;
-    }
-    Serial.println("[I2S] I2S0 (TX master) initialized and started!");
-    
-    // ---- I2S1: RX Slave (ES7210 microphone) ----
-    i2s_config_t i2s_rx_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX),
-        .sample_rate = SAMPLE_RATE,
+
+    // ============================================================
+    // ESP32-S3-BOX-3 reference design: ONE I2S peripheral (I2S0) runs in
+    // FULL-DUPLEX master mode. It drives BCLK/WS/MCLK out (as OUTPUT) and:
+    //   - data_out (DOUT=GPIO15) -> ES8311 speaker DAC (I2S slave)
+    //   - data_in  (DIN =GPIO16) <- ES7210 mic ADC   (I2S slave)
+    // Both codecs share the same bit-clock generated by I2S0. This avoids the
+    // dual-peripheral clock-pin conflict that killed ES8311's bit-clock (and
+    // thus the analog audio) in the previous dual-port design.
+    // ============================================================
+
+    // Legacy ESP-IDF I2S driver (STANDARD I2S, 2-slot stereo, whole-peripheral).
+    // PlatformIO arduino-esp32 (ESP-IDF 4.4.x) does NOT expose the new
+    // i2s_channel_* / i2s_tdm APIs, and the legacy TDM reader could not align WS
+    // to ES7210's TDM frame-sync (all-zero capture). Standard I2S 2-slot is the
+    // simplest proven path and is ALSO what ES8311 playback uses, so TX (ES8311)
+    // and RX (ES7210, MIC1=LEFT/MIC2=RIGHT) share one BCLK/WS cleanly.
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
+        .sample_rate = (int)SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
         .dma_buf_len = 1024,
-        .use_apll = false,  // Only one port can use APLL
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0     // Slave doesn't generate MCLK
+        .use_apll = true,    // APLL gives an EXACT 4.096MHz MCLK; ES7210's internal PLL
+                              // will NOT lock on the imprecise PLL_D2-derived clock used when
+                              // use_apll=false -> that was the root cause of the all-zero capture
+                              // (ANALOG(0x40) bit7 is the PLL-lock status bit, read back 0).
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 4096000,  // explicit 256 * 16000, pins ES7210's PLL to lock
+        .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+        .bits_per_chan = I2S_BITS_PER_CHAN_16BIT,
     };
-    
-    i2s_pin_config_t rx_pin_config = {
-        .mck_io_num = -1,          // No MCLK (provided by I2S0)
-        .bck_io_num = I2S_BCLK,    // Shared with I2S0 (input)
-        .ws_io_num = I2S_WS,       // Shared with I2S0 (input)
-        .data_out_num = -1,        // RX only
-        .data_in_num = I2S_DIN     // ES7210 data
-    };
-    
-    err = i2s_driver_install(I2S_PORT_RX, &i2s_rx_config, 0, NULL);
+    err = i2s_driver_install(i2s_port, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] RX driver install failed: %s\n", esp_err_to_name(err));
-        // Continue anyway - TX still works for speaker
-    } else {
-        err = i2s_set_pin(I2S_PORT_RX, &rx_pin_config);
-        if (err != ESP_OK) {
-            Serial.printf("[I2S] RX set pin failed: %s\n", esp_err_to_name(err));
-        } else {
-            err = i2s_start(I2S_PORT_RX);
-            if (err != ESP_OK) {
-                Serial.printf("[I2S] RX start failed: %s\n", esp_err_to_name(err));
-            } else {
-                Serial.println("[I2S] I2S1 (RX slave) initialized and started!");
-            }
-        }
+        Serial.printf("[I2S] driver_install failed: %s\n", esp_err_to_name(err));
+        return false;
     }
-    
-    // Start TX silence task to keep clock running
+
+    i2s_pin_config_t pin_config = {
+        .mck_io_num = (int)I2S_MCLK,
+        .bck_io_num = (int)I2S_BCLK,
+        .ws_io_num  = (int)I2S_WS,
+        .data_out_num = (int)I2S_DOUT,
+        .data_in_num  = (int)I2S_DIN,
+    };
+    err = i2s_set_pin(i2s_port, &pin_config);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] set_pin failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+
+    err = i2s_start(i2s_port);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] start failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+
+    Serial.println("[I2S] I2S0 initialized in STANDARD I2S 2-slot mode (TX=ES8311 L/R, RX=ES7210 MIC1=LEFT/MIC2=RIGHT)!");
+
+    // Start TX silence task to keep clock running (also clocks ES7210 RX)
     tx_silence_resume();
-    
-    Serial.println("[I2S] Dual-port initialization complete!");
+
+    Serial.println("[I2S] Standard I2S (whole-peripheral) initialization complete!");
     return true;
 }
 
@@ -517,7 +553,7 @@ static void play_test_tone(int duration_ms) {
             buf[i * 2 + 1] = val;
         }
         size_t bytes_written = 0;
-        i2s_write(I2S_PORT_TX, buf, n * 4, &bytes_written, portMAX_DELAY);
+        i2s_write(i2s_port, buf, n * 4, &bytes_written, portMAX_DELAY);
         played += n;
     }
     
@@ -609,7 +645,7 @@ static void play_wav_data(const uint8_t* data, size_t len) {
         }
         
         size_t bytes_written = 0;
-        i2s_write(I2S_PORT_TX, out_buf, samples_to_fill * 4, &bytes_written, portMAX_DELAY);
+        i2s_write(i2s_port, out_buf, samples_to_fill * 4, &bytes_written, portMAX_DELAY);
     }
     
     Serial.printf("[WAV] Playback complete, %zu bytes played\n", pos);
@@ -673,7 +709,8 @@ static int16_t  _lcd_cursor_x = 0;
 static int16_t  _lcd_cursor_y = 0;
 
 // Forward declarations for LCD show functions
-static void lcd_show_reminder(const char* med_name);
+static void lcd_show_reminder(const char* med_name, const char* dosage);
+static void lcd_show_recording();
 
 // ESP-IDF SPI master driver for LCD (more reliable than Arduino SPI on ESP32-S3)
 static spi_device_handle_t lcd_spi;
@@ -1143,9 +1180,9 @@ static inline void lcd_set_cursor(int16_t x, int16_t y) { _lcd_cursor_x = x; _lc
 // ============================================================
 
 static void lcd_backlight_init() {
-    ledcSetup(1, 5000, 10);       // Channel 1, 5kHz, 10-bit resolution
-    ledcAttachPin(LCD_BACKLIGHT, 1);
-    ledcWrite(1, 1023);           // Full brightness (100%)
+    ledcSetup(1, 5000, 10);                 // channel 1, 5kHz, 10-bit resolution
+    ledcAttachPin(LCD_BACKLIGHT, 1);        // attach backlight pin to channel 1
+    ledcWrite(1, 1023);                     // Full brightness (100%)
     Serial.println("[LCD] Backlight initialized (100%)");
 }
 
@@ -1177,7 +1214,7 @@ static void lcd_init() {
     Serial.println("[LCD] Init ILI9341 panel (BSP vendor init)...");
     lcd_init_panel();
 
-    Serial.println("[LCD] ILI9341 initialized! (v7.22 flicker-free clock)");
+    Serial.println("[LCD] ILI9341 initialized! (v7.59: ES7210 full analog init + L/R auto channel select + L/R diag)");
 }
 
 static void lcd_show_boot_screen() {
@@ -1192,7 +1229,7 @@ static void lcd_show_boot_screen() {
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_CYAN, LCD_BLACK);
     lcd_set_cursor(75, 120);   // "Firmware v7.21": 15 chars * 6px = 90, center: (240-90)/2 = 75
-    lcd_print("Firmware v7.22");
+    lcd_print("Firmware v7.67");
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
     lcd_set_cursor(75, 150);   // "Initializing...": 15 chars * 6px = 90, center: (240-90)/2 = 75
     lcd_print("Initializing...");
@@ -1327,7 +1364,16 @@ static void lcd_show_time() {
     lcd_draw_text_fb(60, 100, date_str, 2, LCD_CYAN, LCD_BLACK);
 }
 
-static void lcd_show_reminder(const char* med_name) {
+// Restore the standby main screen (clock + status) after a voice interaction or
+// error. Needed because loop() only does partial framebuffer updates for the clock,
+// so a full-screen overlay like the LISTENING screen would otherwise persist forever.
+static void restore_main_screen() {
+    lcd_fill_screen(LCD_BLACK);
+    lcd_show_time();
+    lcd_show_status();
+}
+
+static void lcd_show_reminder(const char* med_name, const char* dosage) {
     lcd_fill_screen(LCD_BLACK);
     lcd_set_text_size(2);
     lcd_set_text_color(LCD_RED, LCD_BLACK);
@@ -1336,21 +1382,98 @@ static void lcd_show_reminder(const char* med_name) {
 
     lcd_set_text_size(3);
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
-    lcd_set_cursor(20, 80);   // med name: approx center, max ~10 chars * 18px = 180px
+    lcd_set_cursor(20, 75);   // med name: approx center, max ~10 chars * 18px = 180px
     char buf[22];
     strncpy(buf, med_name, 21);
     buf[21] = '\0';
     lcd_print(buf);
 
+    // 剂量（新增：屏幕显示药物用量）
     lcd_set_text_size(2);
     lcd_set_text_color(LCD_WHITE, LCD_BLACK);
-    lcd_set_cursor(66, 130);  // "TAKE NOW!": 9 chars * 12px = 108, center: (240-108)/2=66
+    lcd_set_cursor(20, 112);  // "用量：XXX": below med name
+    char dbuf[48];
+    sprintf(dbuf, "用量：%s", (dosage && strlen(dosage) > 0) ? dosage : "未指定");
+    lcd_print(dbuf);
+
+    lcd_set_text_size(2);
+    lcd_set_text_color(LCD_WHITE, LCD_BLACK);
+    lcd_set_cursor(66, 150);  // "TAKE NOW!": 9 chars * 12px = 108, center: (240-108)/2=66
     lcd_print("TAKE NOW!");
 
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_GREEN, LCD_BLACK);
-    lcd_set_cursor(66, 170);  // "Playing reminder...": 18 chars * 6px = 108, center: (240-108)/2=66
+    lcd_set_cursor(66, 185);  // "Playing reminder...": 18 chars * 6px = 108, center: (240-108)/2=66
     lcd_print("Playing reminder...");
+}
+
+// ============================================================
+// HTTP WAV download (buffer only, no play) — for repeated playback
+// ============================================================
+static bool download_wav_buffer(const String& url, uint8_t*& out_buf, int& out_len) {
+    out_buf = nullptr;
+    out_len = 0;
+    Serial.printf("[HTTP] Downloading WAV (buffer): %s\n", url.c_str());
+
+    HTTPClient http;
+    http.setTimeout(30000);
+    http.setConnectTimeout(5000);
+
+    if (!http.begin(url)) {
+        Serial.println("[HTTP] Failed to begin connection");
+        return false;
+    }
+
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("[HTTP] GET failed: %d\n", code);
+        http.end();
+        return false;
+    }
+
+    int content_len = http.getSize();
+    Serial.printf("[HTTP] Content-Length: %d\n", content_len);
+
+    if (content_len <= 0 || content_len > 1048576) {
+        Serial.println("[HTTP] Invalid content length");
+        http.end();
+        return false;
+    }
+
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(content_len, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        Serial.println("[HTTP] Failed to allocate PSRAM buffer");
+        http.end();
+        return false;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    int total_read = 0;
+    unsigned long start_ms = millis();
+
+    while (total_read < content_len && millis() - start_ms < 30000) {
+        int available = stream->available();
+        if (available) {
+            int read = stream->readBytes(buf + total_read, min(available, content_len - total_read));
+            if (read <= 0) break;
+            total_read += read;
+        } else {
+            delay(10);
+        }
+    }
+
+    http.end();
+
+    if (total_read < content_len) {
+        Serial.printf("[HTTP] Incomplete download: %d / %d\n", total_read, content_len);
+        free(buf);
+        return false;
+    }
+
+    out_buf = buf;
+    out_len = total_read;
+    Serial.printf("[HTTP] Downloaded %d bytes (buffer ready)\n", total_read);
+    return true;
 }
 
 // ============================================================
@@ -1463,14 +1586,23 @@ static void poll_medication_reminders() {
         for (JsonObject reminder : doc.as<JsonArray>()) {
             const char* audio_url = reminder["audioUrl"] | "";
             const char* med_name = reminder["medicationName"] | "unknown";
+            const char* dosage = reminder["dosage"] | "";
             bool played = reminder["played"] | false;
             String id = reminder["id"].as<String>();
             
             if (!played && strlen(audio_url) > 0 && !was_played(id)) {
-                Serial.printf("[POLL] Playing reminder for: %s\n", med_name);
-                lcd_show_reminder(med_name);
-                bool play_ok = download_and_play_wav(String(audio_url));
-                if (play_ok) {
+                Serial.printf("[POLL] Playing reminder for: %s (x%d, +dose)\n", med_name, REMINDER_REPEAT);
+                uint8_t* wav_buf = nullptr;
+                int wav_len = 0;
+                if (download_wav_buffer(String(audio_url), wav_buf, wav_len)) {
+                    lcd_show_reminder(med_name, dosage);
+                    for (int r = 0; r < REMINDER_REPEAT; r++) {
+                        play_wav_data(wav_buf, wav_len);
+                        if (r < REMINDER_REPEAT - 1) {
+                            delay(REMINDER_REPEAT_INTERVAL_MS);
+                        }
+                    }
+                    free(wav_buf);
                     mark_as_played_local(id);
                     // Mark as played on server
                     String mark_url = String(SERVER_BASE) + "/api/schedules/" +
@@ -1480,7 +1612,7 @@ static void poll_medication_reminders() {
                     http2.PUT("");
                     http2.end();
                 } else {
-                    Serial.printf("[POLL] Playback failed for %s, will retry next poll\n", med_name);
+                    Serial.printf("[POLL] Download failed for %s, will retry next poll\n", med_name);
                 }
             }
         }
@@ -1545,16 +1677,22 @@ static void write_wav_header(uint8_t* header, uint32_t data_len, uint16_t channe
 // Record audio from ES7210 via I2S1, then upload to server
 static void record_and_upload_voice() {
     if (voice_recording) return;
+#if !I2S_RX_ENABLED
+    Serial.println("[VOICE] RX disabled in this build (TX-only audio). Skipping recording.");
+    return;
+#endif
     voice_recording = true;
     
     Serial.println("[VOICE] Starting recording...");
+    lcd_show_recording();
     
     // Allocate PSRAM buffer for raw stereo data
     // Max: 5s * 16kHz * 2ch * 2bytes = 320000 bytes
-    size_t max_bytes = SAMPLE_RATE * 2 * 2 * (MAX_RECORD_MS / 1000);
+    size_t max_bytes = SAMPLE_RATE * 2 * (MAX_RECORD_MS / 1000);  // mono: 1 ch * 2 bytes/sample
     int16_t* raw_buf = (int16_t*)heap_caps_malloc(max_bytes, MALLOC_CAP_SPIRAM);
     if (!raw_buf) {
         Serial.println("[VOICE] ERROR: PSRAM alloc failed!");
+        restore_main_screen();
         voice_recording = false;
         return;
     }
@@ -1567,52 +1705,45 @@ static void record_and_upload_voice() {
     unsigned long last_voice_ms = 0;
     
     uint8_t chunk[RECORD_CHUNK];
-    
-    // ---- Diagnostic: probe BCLK/WS before recording ----
-    {
-        pinMode(I2S_BCLK, INPUT_PULLUP);
-        pinMode(I2S_WS, INPUT_PULLUP);
-        int bclk_trans = 0, ws_trans = 0;
-        bool bclk_last = digitalRead(I2S_BCLK);
-        bool ws_last = digitalRead(I2S_WS);
-        for (int i = 0; i < 5000; i++) {  // ~50ms
-            bool b = digitalRead(I2S_BCLK);
-            if (b != bclk_last) { bclk_trans++; bclk_last = b; }
-            bool w = digitalRead(I2S_WS);
-            if (w != ws_last) { ws_trans++; ws_last = w; }
-            delayMicroseconds(10);
-        }
-        Serial.printf("[DIAG] BCLK(GPIO17) transitions in 50ms: %d (>1000=active)\n", bclk_trans);
-        Serial.printf("[DIAG] WS(GPIO45) transitions in 50ms: %d (>50=active)\n", ws_trans);
-        // Restore pin config for I2S
-        // The I2S driver should re-claim these pins, but let's be safe
-    }
-    
+    long sumAbsL = 0, sumAbsR = 0;  // per-channel (L/R) energy for diagnosis
+
+    // (BCLK/WS probe diagnostics removed: pinMode INPUT would halt the I2S bit-clock)
+
     while (total_raw_bytes < max_bytes && 
            (millis() - start_ms < MAX_RECORD_MS)) {
         
         size_t bytes_read = 0;
         // Pre-fill with 0xAA for diagnostic
         memset(chunk, 0xAA, RECORD_CHUNK);
-        esp_err_t err = i2s_read(I2S_PORT_RX, chunk, RECORD_CHUNK, &bytes_read, pdMS_TO_TICKS(100));
+        esp_err_t err = i2s_read(i2s_port, chunk, RECORD_CHUNK, &bytes_read, pdMS_TO_TICKS(100));
         
         if (err != ESP_OK || bytes_read == 0) {
             Serial.printf("[VOICE] i2s_read err=%s bytes=%d\n", esp_err_to_name(err), (int)bytes_read);
             continue;
         }
         
-        // Convert stereo to mono and check VAD
+        // Standard I2S 2-slot decode: each I2S frame = 2 slots * 16bit = 4 bytes.
+        // ES7210 (standard I2S mode, SDP2=0x00) outputs MIC1=LEFT(slot0) / MIC2=RIGHT(slot1).
+        // IMPORTANT (verified on BOX-3, v7.67): the BOX-3 onboard mic is physically
+        // wired to ES7210 MIC2 -> I2S RIGHT channel. MIC1/LEFT is unconnected (only
+        // picks up noise). We therefore take the louder of L/R so the real voice on
+        // RIGHT is always selected (R energy ~1e6 vs L ~3e5 in testing).
         int16_t* samples = (int16_t*)chunk;
-        int num_frames = bytes_read / 4;  // 2ch * 2bytes per frame
-        
+        int num_frames = bytes_read / 4;  // 2 slots * 2 bytes per stereo frame
+
         for (int i = 0; i < num_frames && total_samples < max_bytes / 2; i++) {
-            int16_t left = samples[i * 2];
-            // int16_t right = samples[i * 2 + 1];
-            int16_t mono = left;  // Use left channel (MIC1)
-            
+            int16_t left  = samples[i * 2 + 0];
+            int16_t right = samples[i * 2 + 1];
+            int16_t aL = (left  >= 0) ? left  : (int16_t)(-left);
+            int16_t aR = (right >= 0) ? right : (int16_t)(-right);
+            sumAbsL += aL;
+            sumAbsR += aR;
+
+            int16_t mono = (aL >= aR) ? left : right;
+
             raw_buf[total_samples++] = mono;
             total_raw_bytes += 2;
-            
+
             // VAD check
             int16_t abs_val = (mono >= 0) ? mono : (int16_t)(-mono);
             if (abs_val > VAD_THRESHOLD) {
@@ -1642,6 +1773,8 @@ static void record_and_upload_voice() {
         Serial.println();
         Serial.printf("[DIAG] I2S-RX-chunk0: min=%d max=%d range=%d\n", 
                       min_val, max_val, max_val - min_val);
+        Serial.printf("[DIAG] I2S L/R energy: L=%ld R=%ld (chosen=%s)\n",
+                      sumAbsL, sumAbsR, (sumAbsL >= sumAbsR) ? "LEFT(MIC1)" : "RIGHT(MIC2)");
     }
     
     Serial.printf("[VOICE] Recorded %d mono samples (%d ms), voice=%s\n",
@@ -1657,6 +1790,7 @@ static void record_and_upload_voice() {
     if (total_samples == 0) {
         Serial.println("[VOICE] ERROR: No data recorded!");
         free(raw_buf);
+        restore_main_screen();
         voice_recording = false;
         return;
     }
@@ -1667,6 +1801,7 @@ static void record_and_upload_voice() {
     if (!wav_buf) {
         Serial.println("[VOICE] ERROR: WAV buffer alloc failed!");
         free(raw_buf);
+        restore_main_screen();
         voice_recording = false;
         return;
     }
@@ -1676,7 +1811,7 @@ static void record_and_upload_voice() {
     free(raw_buf);
     
     // Upload to server
-    String url = String(SERVER_BASE) + "/api/voice";
+    String url = String(SERVER_BASE) + "/api/voice?mac=" + String(DEVICE_MAC);
     Serial.printf("[VOICE] Uploading %zu bytes to %s\n", wav_size, url.c_str());
     
     HTTPClient http;
@@ -1706,12 +1841,27 @@ static void record_and_upload_voice() {
     }
     
     free(wav_buf);
+    restore_main_screen();
     voice_recording = false;
     Serial.println("[VOICE] Done.");
 }
 
-// ============================================================
-// SETUP
+// Recording screen: shown while capturing voice from ES7210
+static void lcd_show_recording() {
+    lcd_fill_screen(LCD_BLACK);
+    lcd_set_text_size(2);
+    lcd_set_text_color(LCD_GREEN, LCD_BLACK);
+    lcd_set_cursor(48, 40);   // "LISTENING": 9 chars * 12px = 108, center (240-108)/2=66
+    lcd_print("LISTENING");
+    lcd_set_text_size(3);
+    lcd_set_text_color(LCD_WHITE, LCD_BLACK);
+    lcd_set_cursor(108, 100); // "..."
+    lcd_print("...");
+    lcd_set_text_size(1);
+    lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
+    lcd_set_cursor(40, 160);  // "Recording voice..."
+    lcd_print("Recording voice...");
+}
 // ============================================================
 void setup() {
     Serial.begin(115200);
@@ -1719,7 +1869,7 @@ void setup() {
     
     Serial.println("\n\n====================================");
     Serial.println("  Medication Reminder - ESP-BOX-3");
-    Serial.println("  Firmware v7.22 (flicker-free clock display)");
+    Serial.println("  Firmware v7.67 (ROOT-CAUSE FIX for all-zero capture: MCLK now APLL-derived EXACT 4.096MHz (use_apll=true, fixed_mclk=4096000). ES7210 internal PLL would not lock on the imprecise PLL_D2 clock used when use_apll=false -> ANALOG(0x40) bit7 (PLL-lock status) stayed 0 -> ADC silent. Standard I2S 2-slot, MIC1=LEFT)");
     Serial.println("====================================\n");
 
     // ---- Step 0: Initialize LCD ----
@@ -1765,13 +1915,33 @@ void setup() {
     
     // ---- Step 3: Initialize ES8311 (speaker DAC) ----
     Serial.println("[INIT] Step 3: ES8311 codec");
+    delay(300);   // v7.62: cold-boot fix — extra power-up settle before first I2C access
     if (!es8311_init_codec()) {
-        Serial.println("[INIT] ERROR: ES8311 init failed! Dumping regs...");
-        es8311_dump_regs();
+        Serial.println("[INIT] ES8311 init failed, retrying after delay...");
+        delay(300);
+        if (!es8311_init_codec()) {
+            Serial.println("[INIT] ERROR: ES8311 init failed after retry! Dumping regs...");
+            es8311_dump_regs();
+        }
     }
     
-    // ---- Step 3b: Initialize ES7210 (mic ADC) ----
-    Serial.println("[INIT] Step 3b: ES7210 codec");
+    // ---- Step 3b: ES7210 init MOVED to after I2S start (needs MCLK/BCLK running) ----
+
+    // ---- Step 4: Initialize I2S (dual port) ----
+    Serial.println("[INIT] Step 4: I2S dual-port driver");
+    if (!i2s_init_driver()) {
+        Serial.println("[INIT] ERROR: I2S init failed!");
+        return;
+    }
+
+    // ---- Step 4b: Initialize ES7210 (mic ADC) AFTER I2S clock is running ----
+    // ES7210 is an I2S SLAVE; its internal ADC sampling clock is derived from MCLK
+    // (GPIO2, driven by I2S0). Initializing it BEFORE i2s_start() means no MCLK is
+    // present, so the internal clock divider never locks -> digital output stays 0.
+    // Moving init here (MCLK/BCLK/WS already running) makes it lock reliably, fixing
+    // the dead-after-reboot all-zero recording.
+    Serial.println("[INIT] Step 4b: ES7210 codec (after I2S clock start)");
+    delay(300);  // v7.62: cold-boot fix — longer MCLK/BCLK settle before ES7210 clock config
     if (found_es7210) {
         if (!es7210_init_codec()) {
             Serial.println("[INIT] ERROR: ES7210 init failed!");
@@ -1779,14 +1949,7 @@ void setup() {
     } else {
         Serial.println("[INIT] ES7210 not found, skipping mic init");
     }
-    
-    // ---- Step 4: Initialize I2S (dual port) ----
-    Serial.println("[INIT] Step 4: I2S dual-port driver");
-    if (!i2s_init_driver()) {
-        Serial.println("[INIT] ERROR: I2S init failed!");
-        return;
-    }
-    
+
     // ---- Step 5: Configure GPIO1 voice button ----
     Serial.println("[INIT] Step 5: Voice button (GPIO1)");
     pinMode(VOICE_BTN, INPUT_PULLUP);

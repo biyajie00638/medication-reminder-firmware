@@ -1,9 +1,20 @@
+# Build artifacts
 .pio/
 .pioenvs/
-.vscode/
-*.bin
-*.elf
-*.o
-sdkconfig
-sdkconfig.old
+.piolibdeps/
+build/
+sdkconfig.esp32s3box3
+CMakeLists.txt
+src/CMakeLists.txt
 
+# Debug / capture logs
+monitor_*.log
+
+# Temp / backup sources from debugging sessions
+*.bak
+*.tmp
+src/main.cpp.bak
+src/main.cpp.tmp
+src/main.cpp.v3.2.bak
+v722_ref.cpp
+convert_i2s.py
