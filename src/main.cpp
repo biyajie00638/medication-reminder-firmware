@@ -701,8 +701,8 @@ static void mark_as_played_local(const String& id);
 #define LCD_YELLOW  0xFFE0
 
 // LCD state
-static uint16_t _lcd_w = 240;  // Portrait width
-static uint16_t _lcd_h = 320;  // Portrait height
+static uint16_t _lcd_w = 320;  // Landscape width (panel is 320x240 physical)
+static uint16_t _lcd_h = 240;  // Landscape height
 static uint16_t _lcd_fg = LCD_WHITE;
 static uint16_t _lcd_bg = LCD_BLACK;
 static uint8_t  _lcd_textsize = 1;
@@ -905,11 +905,21 @@ static void lcd_init_panel() {
     lcd_write_cmd(0xB1);
     lcd_write_data_buf((const uint8_t[]){0x00, 0x1B}, 2);
 
-    // MADCTL: portrait, mirror X+Y, BGR
-    // BSP uses 0x08 then esp_lcd_panel_mirror(true,true) adds MX+MY → 0xC8
-    // We set 0xC8 directly for portrait 240x320
+    // Display Function Control (sets scan lines = 320)
+    // NOTE: esp_lcd_panel_ili9341 driver writes this in its BASE init; our manual
+    // init omitted it, so the panel only scanned ~240 lines -> bottom grey band.
+    // 0x27 => NL = (0x27+1)*8 = 320 lines. SS=1/GS=0 keeps upright orientation.
+    lcd_write_cmd(0xB6);
+    lcd_write_data_buf((const uint8_t[]){0x08, 0x82, 0x27}, 3);
+
+    // MADCTL: NO XY swap (MV=0) so our framebuffer maps AXIS-ALIGNED to the panel
+    // (x->column, y->row). The ILI9341 panel is physically 320x240 (landscape);
+    // with MV=0 and a 320-wide framebuffer the panel fills completely and the
+    // content is UPRIGHT (no 90-degree rotation). MY/MX=0 (no mirror). BGR=1.
+    // (Earlier MV=1 experiments DID fill the panel but rotated content 90 degrees,
+    //  because a 240x320 fb gets transposed. MV=0 + 320x240 fb is the correct fix.)
     lcd_write_cmd(ILI9341_MADCTL);
-    lcd_write_data8(0xC8);  // MY=1,MX=1,MV=0,BGR=1 (portrait 240x320, image upright)
+    lcd_write_data8(0xC8);  // MY=1,MX=1,MV=0,BGR=1 (320x240 landscape fb -> full upright + correct mirror, v7.76)
 
     // Pixel format: 16-bit/pixel (RGB565)
     lcd_write_cmd(ILI9341_PIXFMT);
@@ -931,11 +941,12 @@ static void lcd_init_panel() {
 // Fill screen with solid color (using DMA for speed)
 // Writes 244 columns (4 extra beyond 240) to cover grey bar on right edge
 static void lcd_fill_screen(uint16_t color) {
-    const int FILL_COLS = 244;  // 240 visible + 4 extra to cover grey bar
+    const int FILL_COLS = _lcd_w;  // full framebuffer width (MV=1 fills entire panel, no grey bar)
     lcd_set_addr(0, 0, FILL_COLS - 1, _lcd_h - 1);
     
     // Build one line of pixel data (DMA-capable static buffer)
-    static uint8_t line_buf[256 * 2];
+    // MUST be sized to full panel width (320) to avoid overflow on landscape
+    static uint8_t line_buf[320 * 2];
     for (int i = 0; i < FILL_COLS; i++) {
         line_buf[i * 2] = (uint8_t)(color >> 8);
         line_buf[i * 2 + 1] = (uint8_t)(color & 0xFF);
@@ -1156,21 +1167,6 @@ static void lcd_printf(const char* fmt, ...) {
     lcd_print(buf);
 }
 
-// Draw a diagnostic test pattern (color bars)
-// Call after lcd_init_panel() to verify SPI writes reach the panel
-static void lcd_test_pattern() {
-    // Draw 8 color bars, each 40px wide (320/8=40)
-    uint16_t colors[8] = {
-        LCD_BLACK, LCD_BLUE, LCD_GREEN, LCD_CYAN,
-        LCD_RED, LCD_YELLOW, LCD_WHITE, 0xFC00 // Orange-ish
-    };
-    for (int bar = 0; bar < 8; bar++) {
-        uint16_t x = bar * 40;
-        lcd_fill_rect(x, 0, 40, _lcd_h, colors[bar]);
-    }
-    Serial.println("[LCD] Test pattern drawn (8 color bars)");
-}
-
 // LCD text API (matching Adafruit style for easy code migration)
 static inline void lcd_set_text_size(uint8_t s) { _lcd_textsize = s; }
 static inline void lcd_set_text_color(uint16_t fg, uint16_t bg) { _lcd_fg = fg; _lcd_bg = bg; }
@@ -1211,68 +1207,68 @@ static void lcd_init() {
     delay(50);
     Serial.println("[LCD] SPI bus OK");
 
-    // Step 4: ILI9341 panel init (official BSP vendor sequence)
+    // Step 4: ILI9341 panel init (official BSP vendor sequence + 0xB6 320-line fix)
     Serial.println("[LCD] Init ILI9341 panel (BSP vendor init)...");
     lcd_init_panel();
 
-    Serial.println("[LCD] ILI9341 initialized! (v7.70: CJK Chinese font display for reminder screen)");
+    Serial.println("[LCD] ILI9341 initialized! (v7.76: landscape 320x240 + MADCTL 0xC8 upright+mirror, full-panel no grey bar; CJK Chinese font)");
 }
 
 static void lcd_show_boot_screen() {
     lcd_fill_screen(LCD_BLACK);
     lcd_set_text_color(LCD_WHITE, LCD_BLACK);
     lcd_set_text_size(3);
-    lcd_set_cursor(39, 20);   // "ESP-BOX-3": 9 chars * 18px = 162, center: (240-162)/2 = 39
+    lcd_set_cursor(79, 20);   // "ESP-BOX-3": 9 chars * 18px = 162, center: (320-162)/2 = 79
     lcd_print("ESP-BOX-3");
     lcd_set_text_size(2);
-    lcd_set_cursor(6, 70);    // "Medication Reminder": 19 chars * 12px = 228, center: (240-228)/2 = 6
+    lcd_set_cursor(46, 70);   // "Medication Reminder": 19 chars * 12px = 228, center: (320-228)/2 = 46
     lcd_print("Medication Reminder");
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_CYAN, LCD_BLACK);
-    lcd_set_cursor(75, 120);   // "Firmware v7.21": 15 chars * 6px = 90, center: (240-90)/2 = 75
-    lcd_print("Firmware v7.70");
+    lcd_set_cursor(115, 120);  // "Firmware v7.72": 15 chars * 6px = 90, center: (320-90)/2 = 115
+    lcd_print("Firmware v7.76");
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
-    lcd_set_cursor(75, 150);   // "Initializing...": 15 chars * 6px = 90, center: (240-90)/2 = 75
+    lcd_set_cursor(115, 145);  // "Initializing...": 15 chars * 6px = 90
     lcd_print("Initializing...");
 }
 
 static void lcd_show_wifi_connecting() {
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
-    lcd_fill_rect(80, 140, 180, 16, LCD_BLACK);
-    lcd_set_cursor(80, 140);
+    lcd_fill_rect(100, 120, 180, 16, LCD_BLACK);  // landscape center
+    lcd_set_cursor(100, 120);
     lcd_print("Connecting WiFi...");
 }
 
 static void lcd_show_wifi_connected(const char* ip) {
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_GREEN, LCD_BLACK);
-    lcd_fill_rect(80, 140, 200, 32, LCD_BLACK);
-    lcd_set_cursor(80, 140);
+    lcd_fill_rect(100, 120, 200, 32, LCD_BLACK);
+    lcd_set_cursor(100, 120);
     lcd_print("WiFi Connected!");
-    lcd_set_cursor(80, 155);
+    lcd_set_cursor(100, 135);
     lcd_printf("IP: %s", ip);
 }
 
 static void lcd_show_status() {
     lcd_set_text_size(1);
 
-    // WiFi status (y=140-155)
+    // WiFi status
     lcd_set_text_color(LCD_GREEN, LCD_BLACK);
-    lcd_fill_rect(0, 140, 240, 16, LCD_BLACK);
+    lcd_fill_rect(0, 155, _lcd_w, 16, LCD_BLACK);
     if (WiFi.status() == WL_CONNECTED) {
-        lcd_set_cursor(60, 140);
+        lcd_set_cursor(90, 155);
         lcd_printf("WiFi: %s", WiFi.localIP().toString().c_str());
     } else {
-        lcd_set_cursor(60, 140);
+        lcd_set_cursor(90, 155);
         lcd_print("WiFi: Disconnected");
     }
 
-    // System status (y=170-185)
-    lcd_fill_rect(0, 170, 240, 32, LCD_BLACK);
-    lcd_set_cursor(80, 170);
+    // System status
+    lcd_fill_rect(0, 175, _lcd_w, 32, LCD_BLACK);
+    lcd_set_cursor(110, 175);
     lcd_print("System Ready");
-    lcd_set_cursor(75, 185);
+    lcd_set_cursor(105, 190);
     lcd_print("Polling reminders...");
 }
 
@@ -1295,9 +1291,9 @@ static void lcd_draw_text_fb(int16_t x, int16_t y, const char* str,
     if (fb_w > _lcd_w) fb_w = _lcd_w;
 
     // Static framebuffer in internal SRAM (fast access, no alloc overhead)
-    // Max usage: size=4, 8 chars → 192 wide × 30 tall = 5760 entries
-    static uint16_t fb[200 * 40];       // 16 KB worst case
-    static uint8_t  row_bytes[200 * 2]; // 400 bytes
+    // Sized for full landscape width (320) to avoid overflow when fb_w clamps to _lcd_w
+    static uint16_t fb[320 * 40];       // 25.6 KB worst case (320 wide × 40 tall)
+    static uint8_t  row_bytes[320 * 2]; // 640 bytes
 
     // Fill framebuffer with background color
     for (int i = 0; i < fb_w * fb_h; i++) fb[i] = bg;
@@ -1415,6 +1411,8 @@ static void lcd_draw_cjk_fb(int16_t x, int16_t y, const char* str,
                              int max_width = -1) {
     if (!str || !*str) return;
 
+    const int CJK_FB_CAP = 320 * 100;  // must match cjk_fb[] size below
+
     int cell_w = CJK_GLYPH_W * scale;
     int cell_h = CJK_GLYPH_H * scale;
     int pad_y   = 4;  // vertical padding
@@ -1443,10 +1441,16 @@ static void lcd_draw_cjk_fb(int16_t x, int16_t y, const char* str,
     int fb_w   = max_line_w;
     int fb_h   = lines * cell_h + pad_y * (lines > 1 ? lines : 2);
     if (fb_h > _lcd_h) fb_h = _lcd_h;
+    // Defensive: never exceed framebuffer capacity (prevents SRAM overflow)
+    if (fb_w * fb_h > CJK_FB_CAP) {
+        fb_h = CJK_FB_CAP / fb_w;
+        if (fb_h < 1) fb_h = 1;
+    }
 
-    // Static framebuffer in SRAM (worst case: ~24 chars × 32px wide × 36px tall ≈ 31KB)
-    static uint16_t cjk_fb[240 * 50];       // max 240×50 = 24KB
-    static uint8_t  cjk_row_bytes[240 * 2]; // SPI row buffer
+    // Static framebuffer in SRAM. Capacity must cover worst-case block:
+    // full 320-wide × up to ~100 rows (multi-line wrapped med name).
+    static uint16_t cjk_fb[320 * 100];      // 64 KB (landscape width × 100 rows) — matches CJK_FB_CAP
+    static uint8_t  cjk_row_bytes[320 * 2]; // SPI row buffer
 
     // Clear to background
     for (int i = 0; i < fb_w * fb_h; i++) cjk_fb[i] = bg_color;
@@ -1497,13 +1501,13 @@ static void lcd_show_time() {
         strcpy(date_str, "----  -  --");
     }
 
-    // Time: size 4, centered — flicker-free framebuffer rendering
-    // 8 chars * 24px = 192 → x = (240-192)/2 = 24
-    lcd_draw_text_fb(24, 50, time_str, 4, LCD_WHITE, LCD_BLACK);
+    // Time: size 4, centered in 320-wide landscape — flicker-free framebuffer rendering
+    // 8 chars * 24px = 192 → x = (320-192)/2 = 64
+    lcd_draw_text_fb(64, 30, time_str, 4, LCD_WHITE, LCD_BLACK);
 
     // Date: size 2, centered — flicker-free framebuffer rendering
-    // 10 chars * 12px = 120 → x = (240-120)/2 = 60
-    lcd_draw_text_fb(60, 100, date_str, 2, LCD_CYAN, LCD_BLACK);
+    // 10 chars * 12px = 120 → x = (320-120)/2 = 100
+    lcd_draw_text_fb(100, 80, date_str, 2, LCD_CYAN, LCD_BLACK);
 }
 
 // Restore the standby main screen (clock + status) after a voice interaction or
@@ -1516,46 +1520,43 @@ static void restore_main_screen() {
 }
 
 static void lcd_show_reminder(const char* med_name, const char* dosage) {
-    // v7.70: Full Chinese reminder screen using CJK bitmap font.
-    // Layout (portrait 240x320):
-    //   y=8:    "⚠ 服药提醒 ⚠"       scale=1 red
-    //   y=48:   [药名]                scale=2 yellow (centered, auto-wrap)
-    //   y=112:  "用量：[剂量]"         scale=2 white  (centered)
-    //   y=176:  "请按时服用！"          scale=2 cyan  (centered)
-    //   y=228:  "正在播放语音..."      scale=1 green (centered)
+    // v7.72d: Full Chinese reminder screen using CJK bitmap font.
+    // Layout (landscape 320x240):
+    //   y=4:    "⚠ 服药提醒 ⚠"       scale=1 red     (title bar)
+    //   y=28:   [药名]                scale=2 yellow (big, centered, auto-wrap if long)
+    //   y=68:   "用量：[剂量]"        scale=2 white  (centered)
+    //   y=116:  "请按时服用！"         scale=2 cyan  (centered)
+    //   y=184:  "正在播放语音..."      scale=1 green (bottom status line)
 
     lcd_fill_screen(LCD_BLACK);
 
     // Title line — "⚠ 服药提醒 ⚠" (scale 1, 16px tall)
-    const char* title = "\xE2\x9A\xA0 \E6\x9C\x8D\xE8\x8D\xAF\xE6\x8F\x90\xE9\x86\x92 \xE2\x9A\xA0";  // UTF-8: "⚠ 服药提醒 ⚠"
+    const char* title = "\xE2\x9A\xA0 \xE6\x9C\x8D\xE8\x8D\xAF\xE6\x8F\x90\xE9\x86\x92 \xE2\x9A\xA0";  // UTF-8: "⚠ 服药提醒 ⚠"
     int tw = cjk_measure_width(title, 1);
-    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 8, title, 1, LCD_RED, LCD_BLACK);
+    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 4, title, 1, LCD_RED, LCD_BLACK);
 
-    // Med name — big, scale 2 (32px), auto-wrap if too wide
+    // Med name — big, scale 2 (32px), centered, auto-wrap if too wide for 320px
     int mnw = cjk_measure_width(med_name ? med_name : "", 2);
-    int mnx = (mnw < _lcd_w) ? (_lcd_w - mnw) / 2 : 4;  // center or left-align with margin
-    lcd_draw_cjk_fb(mnx, 48, med_name ? med_name : "(未命名)", 2,
+    int mnx = (mnw < _lcd_w) ? (_lcd_w - mnw) / 2 : 4;
+    lcd_draw_cjk_fb(mnx, 28, med_name ? med_name : "(未命名)", 2,
                     LCD_YELLOW, LCD_BLACK, _lcd_w - 8);
 
     // Dosage — scale 2
     char dbuf[64];
     snprintf(dbuf, sizeof(dbuf), "\xE7\x94\xA8\xE9\x87\x8F\xEF\xBC\x9A%s",
              (dosage && strlen(dosage) > 0) ? dosage : "\xE6\x9C\xAA\xE6\x8C\x87\xE5\xAE\x9A");
-    // UTF-8: "用量：" + value / "未指定"
     int dsw = cjk_measure_width(dbuf, 2);
-    lcd_draw_cjk_fb((_lcd_w - dsw) / 2, 112, dbuf, 2, LCD_WHITE, LCD_BLACK);
+    lcd_draw_cjk_fb((_lcd_w - dsw) / 2, 68, dbuf, 2, LCD_WHITE, LCD_BLACK);
 
     // Action prompt — "请按时服用！" scale 2
     const char* action = "\xE8\xAF\xB7\xE6\x8C\x89\xE6\x97\xB6\xE6\x9C\x8D\xE7\x94\xA8\xEF\xBC\x81";
-    // UTF-8: "请按时服用！"
     int aw = cjk_measure_width(action, 2);
-    lcd_draw_cjk_fb((_lcd_w - aw) / 2, 176, action, 2, LCD_CYAN, LCD_BLACK);
+    lcd_draw_cjk_fb((_lcd_w - aw) / 2, 116, action, 2, LCD_CYAN, LCD_BLACK);
 
     // Status — "正在播放语音..." scale 1
     const char* status = "\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x92\xAD\xE6\x94\xBE\xE8\xAF\xAD\xE9\x9F\xB3...";
-    // UTF-8: "正在播放语音..."
     int sw = cjk_measure_width(status, 1);
-    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 228, status, 1, LCD_GREEN, LCD_BLACK);
+    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 184, status, 1, LCD_GREEN, LCD_BLACK);
 }
 
 // ============================================================
@@ -2002,15 +2003,15 @@ static void lcd_show_recording() {
     lcd_fill_screen(LCD_BLACK);
     lcd_set_text_size(2);
     lcd_set_text_color(LCD_GREEN, LCD_BLACK);
-    lcd_set_cursor(48, 40);   // "LISTENING": 9 chars * 12px = 108, center (240-108)/2=66
+    lcd_set_cursor(106, 30);  // "LISTENING" centered in 320: (320-108)/2=106
     lcd_print("LISTENING");
     lcd_set_text_size(3);
     lcd_set_text_color(LCD_WHITE, LCD_BLACK);
-    lcd_set_cursor(108, 100); // "..."
+    lcd_set_cursor(148, 80);  // "..." centered
     lcd_print("...");
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
-    lcd_set_cursor(40, 160);  // "Recording voice..."
+    lcd_set_cursor(110, 140); // "Recording voice..." centered
     lcd_print("Recording voice...");
 }
 // ============================================================
@@ -2020,7 +2021,7 @@ void setup() {
     
     Serial.println("\n\n====================================");
     Serial.println("  Medication Reminder - ESP-BOX-3");
-    Serial.println("  Firmware v7.70 (CJK display: GB2312 16x16 dot-matrix font via auto-generated cjk_font.h from simhei.ttf; reminder screen now shows Chinese medication name + dosage. Builds on v7.67 MCLK APLL fix.)");
+    Serial.println("  Firmware v7.76 (CJK display + LANDSCAPE 320x240 full-panel fix: MADCTL 0xC8 (MY=1,MX=1,MV=0) gives upright + correct-mirror orientation; _lcd_w/h=320x240 matches physical ILI9341 panel; buffer overflows fixed; GB2312 16x16 dot-matrix font; Chinese medication name+dosage in landscape. Builds on v7.67 MCLK APLL fix.)");
     Serial.println("====================================\n");
 
     // ---- Step 0: Initialize LCD ----
