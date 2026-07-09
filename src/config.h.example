@@ -1,0 +1,21 @@
+#pragma once
+// ============================================================
+// 使用方法：
+//   1) 复制本文件为 src/config.h
+//   2) 把下面的值改成你自己的
+//   3) src/config.h 已被 .gitignore 忽略，不会随仓库公开，你的凭据不会泄露
+// ============================================================
+
+// 设备要连接的 WiFi 名称与密码
+#define WIFI_SSID       "YOUR_WIFI_SSID"
+#define WIFI_PASS       "YOUR_WIFI_PASSWORD"
+
+// 服务端地址（运行 medication-server 的那台机器的 IP:端口）
+// 例如局域网内：http://192.168.1.100:3000
+// 或公网域名：  http://your.domain:3000
+#define SERVER_BASE     "http://YOUR_SERVER_IP:3000"
+
+// 本机 MAC 地址（用于服务端区分不同设备）
+// 可在设备背面标签查看，或烧录后打开串口助手看启动日志里的
+// "[INIT] WiFi SSID from NVS:" 上方打印的 MAC
+#define DEVICE_MAC      "YOUR_DEVICE_MAC"

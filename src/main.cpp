@@ -86,16 +86,14 @@ static i2s_port_t i2s_port = I2S_NUM_0;
 #define RECORD_CHUNK    1024      // I2S read chunk size (bytes)
 
 // ============================================================
-// WIFI CONFIG - Change these!
+// CONFIG — 所有私人凭据放在 src/config.h（已被 .gitignore 忽略）
+// 复制 src/config.h.example -> src/config.h 后填入你自己的值
 // ============================================================
-#define WIFI_SSID       "byj"
-#define WIFI_PASS       "REDACTED_WIFI_PASSWORD"
+#include "config.h"
 
-// ============================================================
-// SERVER CONFIG
-// ============================================================
-#define SERVER_BASE     "http://YOUR_SERVER_IP:3000"
-#define DEVICE_MAC     "e8:f6:0a:a8:c3:bc"
+#ifndef WIFI_SSID
+#error "WIFI_SSID 未定义：请复制 src/config.h.example 为 src/config.h 并填写 WiFi/服务器/MAC"
+#endif
 #define POLL_INTERVAL   60000   // 60s polling interval
 #define REMINDER_REPEAT 5       // 同一条提醒连播次数
 #define REMINDER_REPEAT_INTERVAL_MS 1000  // 连播间隔(毫秒)

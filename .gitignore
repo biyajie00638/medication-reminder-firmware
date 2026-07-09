@@ -18,3 +18,15 @@ src/main.cpp.tmp
 src/main.cpp.v3.2.bak
 v722_ref.cpp
 convert_i2s.py
+
+# Local build config with private credentials (NEVER commit)
+src/config.h
+
+# PlatformIO package cache (very large, regenerated on build)
+pio_home/
+
+# Debug / one-off helper scripts (not part of the project)
+inject_pending.js
+query2.js
+query_pending.js
+read_serial.py
