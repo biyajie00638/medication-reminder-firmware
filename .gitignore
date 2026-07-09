@@ -30,3 +30,6 @@ inject_pending.js
 query2.js
 query_pending.js
 read_serial.py
+
+# Prebuilt firmware binaries (contain device-specific credentials, build locally instead)
+releases/

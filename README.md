@@ -83,18 +83,25 @@ platformio run
 platformio run --target upload --upload-port COM6
 ```
 
-### 4. 不想编译？直接用预编译固件
-`releases/v7.77/` 下有 `bootloader.bin` / `partitions.bin` / `firmware.bin`，可用
-[esptool](https://docs.espressif.com/projects/esptool/) 烧录：
+### 4. 关于固件二进制
+
+本仓库**不提供预编译固件**。固件内含有你的 WiFi 密码、服务器地址等设备专属配置，
+无法直接通用，也不应随公开仓库发布。请按上面的步骤用你自己的 `config.h` 本地编译：
+
+- 编译产物在 `.pio/build/esp32s3box3/`，含 `bootloader.bin` / `partitions.bin` / `firmware.bin`
+- 如需用 esptool 单独烧录（偏移同上）：
 
 ```bash
 esptool.py --chip esp32s3 \
   --before=default_reset --after=hard_reset \
   write_flash --flash_mode dio --flash_size 16MB \
-  0x0       bootloader.bin \
-  0x8000    partitions.bin \
-  0x10000   firmware.bin
+  0x0       .pio/build/esp32s3box3/bootloader.bin \
+  0x8000    .pio/build/esp32s3box3/partitions.bin \
+  0x10000   .pio/build/esp32s3box3/firmware.bin
 ```
+
+> 🔒 **安全提示**：`src/config.h` 已被 `.gitignore` 忽略，提交前请确认其中不含真实凭据；
+> 若曾把含密码的固件推到过别处，请及时修改对应 WiFi / 服务器密码。
 
 ---
 
