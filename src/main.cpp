@@ -31,6 +31,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <HTTPClient.h>
 #include <driver/i2s.h>          // Legacy ESP-IDF I2S driver (only one available in this toolchain)
 #include <driver/spi_master.h>
@@ -919,7 +920,7 @@ static void lcd_init_panel() {
     // (Earlier MV=1 experiments DID fill the panel but rotated content 90 degrees,
     //  because a 240x320 fb gets transposed. MV=0 + 320x240 fb is the correct fix.)
     lcd_write_cmd(ILI9341_MADCTL);
-    lcd_write_data8(0xC8);  // MY=1,MX=1,MV=0,BGR=1 (320x240 landscape fb -> full upright + correct mirror, v7.76)
+    lcd_write_data8(0xC8);  // MY=1,MX=1,MV=0,BGR=1 (320x240 landscape fb -> full upright + correct mirror, v7.77)
 
     // Pixel format: 16-bit/pixel (RGB565)
     lcd_write_cmd(ILI9341_PIXFMT);
@@ -1211,7 +1212,7 @@ static void lcd_init() {
     Serial.println("[LCD] Init ILI9341 panel (BSP vendor init)...");
     lcd_init_panel();
 
-    Serial.println("[LCD] ILI9341 initialized! (v7.76: landscape 320x240 + MADCTL 0xC8 upright+mirror, full-panel no grey bar; CJK Chinese font)");
+    Serial.println("[LCD] ILI9341 initialized! (v7.77: landscape 320x240 + MADCTL 0xC8 upright+mirror, full-panel no grey bar; CJK Chinese font; WiFi config from NVS + server-push)");
 }
 
 static void lcd_show_boot_screen() {
@@ -1226,7 +1227,7 @@ static void lcd_show_boot_screen() {
     lcd_set_text_size(1);
     lcd_set_text_color(LCD_CYAN, LCD_BLACK);
     lcd_set_cursor(115, 120);  // "Firmware v7.72": 15 chars * 6px = 90, center: (320-90)/2 = 115
-    lcd_print("Firmware v7.76");
+    lcd_print("Firmware v7.77");
     lcd_set_text_color(LCD_YELLOW, LCD_BLACK);
     lcd_set_cursor(115, 145);  // "Initializing...": 15 chars * 6px = 90
     lcd_print("Initializing...");
@@ -1772,6 +1773,95 @@ static void poll_medication_reminders() {
 }
 
 // ============================================================
+// WiFi 配置（服务端下发 + NVS 持久化）
+// 设备每 5 分钟轮询 /api/device/:mac/wifi/pending；
+// 若返回新版本则断开重连，成功写 NVS 并 ack，失败回退原账号。
+// ============================================================
+#define WIFI_CFG_NS "wificfg"
+static String g_cur_ssid = WIFI_SSID;
+static String g_cur_pass = WIFI_PASS;
+static int    g_wifi_ver = 0;
+
+static void load_wifi_creds(String &ssid, String &pass) {
+    Preferences prefs;
+    prefs.begin(WIFI_CFG_NS, true);
+    ssid = prefs.getString("ssid", WIFI_SSID);
+    pass = prefs.getString("pass", WIFI_PASS);
+    g_wifi_ver = prefs.getInt("ver", 0);
+    prefs.end();
+}
+
+static void save_wifi_creds(const String &ssid, const String &pass, int ver) {
+    Preferences prefs;
+    prefs.begin(WIFI_CFG_NS, false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.putInt("ver", ver);
+    prefs.end();
+    g_wifi_ver = ver;
+}
+
+static void ack_wifi_config(int ver, bool ok, const char* err) {
+    String url = String(SERVER_BASE) + "/api/device/" + String(DEVICE_MAC) + "/wifi/ack";
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.setConnectTimeout(5000);
+    if (!http.begin(url)) return;
+    http.addHeader("Content-Type", "application/json");
+    String body = "{\"ok\":" + String(ok ? "true" : "false") +
+                  ",\"error\":\"" + String(err ? err : "") + "\"" +
+                  ",\"version\":" + String(ver) + "}";
+    int code = http.POST(body);
+    Serial.printf("[WIFI-CFG] ack sent ok=%d code=%d\n", ok, code);
+    http.end();
+}
+
+static void check_wifi_config() {
+    String url = String(SERVER_BASE) + "/api/device/" + String(DEVICE_MAC) + "/wifi/pending";
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.setConnectTimeout(5000);
+    if (!http.begin(url)) { Serial.println("[WIFI-CFG] begin failed"); return; }
+    int code = http.GET();
+    if (code != 200) { Serial.printf("[WIFI-CFG] GET failed: %d\n", code); http.end(); return; }
+    String resp = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, resp)) { Serial.println("[WIFI-CFG] JSON parse failed"); return; }
+    bool pending = doc["pending"] | false;
+    if (!pending) return;                              // 无待应用配置
+    int ver = doc["version"] | 0;
+    if (ver <= g_wifi_ver) return;                     // 已应用
+    String new_ssid = doc["ssid"] | "";
+    String new_pass = doc["password"] | "";
+    if (new_ssid.isEmpty() || new_pass.isEmpty()) return;
+
+    Serial.printf("[WIFI-CFG] Applying new WiFi: %s (ver=%d, cur=%d)\n", new_ssid.c_str(), ver, g_wifi_ver);
+    String old_ssid = g_cur_ssid, old_pass = g_cur_pass;
+
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(new_ssid.c_str(), new_pass.c_str());
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 40) { delay(500); tries++; }  // 40*500ms=20s
+    if (WiFi.status() == WL_CONNECTED) {
+        save_wifi_creds(new_ssid, new_pass, ver);
+        g_cur_ssid = new_ssid; g_cur_pass = new_pass;
+        Serial.printf("[WIFI-CFG] Connected! IP=%s, ver=%d saved\n", WiFi.localIP().toString().c_str(), ver);
+        ack_wifi_config(ver, true, "");
+    } else {
+        Serial.println("[WIFI-CFG] New WiFi failed, reverting to previous...");
+        WiFi.disconnect();
+        delay(200);
+        WiFi.begin(old_ssid.c_str(), old_pass.c_str());
+        int t2 = 0;
+        while (WiFi.status() != WL_CONNECTED && t2 < 40) { delay(500); t2++; }
+        ack_wifi_config(ver, false, "connect timeout to new AP");
+    }
+}
+
+// ============================================================
 // Print all ES8311 registers (debug)
 // ============================================================
 static void es8311_dump_regs() {
@@ -2021,7 +2111,7 @@ void setup() {
     
     Serial.println("\n\n====================================");
     Serial.println("  Medication Reminder - ESP-BOX-3");
-    Serial.println("  Firmware v7.76 (CJK display + LANDSCAPE 320x240 full-panel fix: MADCTL 0xC8 (MY=1,MX=1,MV=0) gives upright + correct-mirror orientation; _lcd_w/h=320x240 matches physical ILI9341 panel; buffer overflows fixed; GB2312 16x16 dot-matrix font; Chinese medication name+dosage in landscape. Builds on v7.67 MCLK APLL fix.)");
+    Serial.println("  Firmware v7.77 (CJK display + LANDSCAPE 320x240 full-panel fix: MADCTL 0xC8 gives upright+correct-mirror; _lcd_w/h=320x240 matches physical ILI9341 panel; buffer overflows fixed; GB2312 16x16 dot-matrix font; Chinese medication name+dosage in landscape. NEW: WiFi credentials now loaded from NVS (server-pushed via /api/device/:mac/wifi/pending, applied+reconnect+ack with rollback). Builds on v7.67 MCLK APLL fix.)");
     Serial.println("====================================\n");
 
     // ---- Step 0: Initialize LCD ----
@@ -2115,7 +2205,11 @@ void setup() {
     // ---- Step 7: Connect WiFi ----
     Serial.println("[INIT] Step 7: WiFi connect");
     lcd_show_wifi_connecting();
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    String wifi_ssid, wifi_pass;
+    load_wifi_creds(wifi_ssid, wifi_pass);
+    Serial.printf("[INIT] WiFi SSID from NVS: %s (ver=%d)\n", wifi_ssid.c_str(), g_wifi_ver);
+    g_cur_ssid = wifi_ssid; g_cur_pass = wifi_pass;
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     int wifi_attempts = 0;
     while (WiFi.status() != WL_CONNECTED && wifi_attempts < 30) {
         delay(500);
@@ -2175,6 +2269,13 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED && (now - last_poll > POLL_INTERVAL || last_poll == 0)) {
         poll_medication_reminders();
         last_poll = now;
+    }
+
+    // Check for pending WiFi config (server-pushed) every 5 minutes
+    static unsigned long last_wifi_cfg = 0;
+    if (WiFi.status() == WL_CONNECTED && (now - last_wifi_cfg > 300000 || last_wifi_cfg == 0)) {
+        check_wifi_config();
+        last_wifi_cfg = now;
     }
 
     delay(50);
