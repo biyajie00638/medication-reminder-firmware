@@ -1699,6 +1699,126 @@ static bool download_and_play_wav(const String& url) {
 }
 
 // ============================================================
+// PHYSICAL "已服" CONFIRM BUTTON (Phase 1)
+// GPIO1 (top) button = "我已服药". A reminder is only marked
+// confirmed when the button is pressed, never automatically after
+// playback — so adherence data reflects reality. Unconfirmed
+// reminders nag every NAG_INTERVAL_MS until confirmed.
+// ============================================================
+#define NAG_INTERVAL_MS   300000   // 5 min between nag alerts
+#define MAX_PENDING       8
+
+typedef struct {
+    String id;
+    String name;
+    String dosage;
+    String audioUrl;
+    unsigned long next_alert;   // 0 = alert immediately
+    bool active;
+} PendingItem;
+
+static PendingItem pending_list[MAX_PENDING];
+
+// Local record of confirmed reminders (stops re-alert after button press)
+#define MAX_CONFIRMED_IDS 20
+static String confirmed_ids[MAX_CONFIRMED_IDS];
+static int confirmed_idx = 0;
+static bool is_confirmed(const String& id) {
+    for (int i = 0; i < MAX_CONFIRMED_IDS; i++)
+        if (confirmed_ids[i] == id) return true;
+    return false;
+}
+static void mark_confirmed_local(const String& id) {
+    confirmed_ids[confirmed_idx] = id;
+    confirmed_idx = (confirmed_idx + 1) % MAX_CONFIRMED_IDS;
+}
+
+// Alert (and re-nag) any active, unconfirmed reminder whose timer is due.
+static void process_alerts() {
+    unsigned long now = millis();
+    for (int i = 0; i < MAX_PENDING; i++) {
+        PendingItem& p = pending_list[i];
+        if (!p.active) continue;
+        if (now < p.next_alert) continue;
+        uint8_t* wav_buf = nullptr;
+        int wav_len = 0;
+        bool ok = download_wav_buffer(p.audioUrl, wav_buf, wav_len);
+        if (ok) {
+            lcd_show_reminder(p.name.c_str(), p.dosage.c_str());
+            for (int r = 0; r < REMINDER_REPEAT; r++) {
+                play_wav_data(wav_buf, wav_len);
+                if (r < REMINDER_REPEAT - 1) delay(REMINDER_REPEAT_INTERVAL_MS);
+            }
+            free(wav_buf);
+            p.next_alert = now + NAG_INTERVAL_MS;
+            Serial.printf("[ALERT] Nagged %s (%s), next in %d ms\n", p.id.c_str(), p.name.c_str(), NAG_INTERVAL_MS);
+        } else {
+            p.next_alert = now + 30000;  // retry download soon
+            Serial.printf("[ALERT] Download failed for %s, retry in 30s\n", p.name.c_str());
+        }
+    }
+}
+
+// "已确认" acknowledgement screen
+static void lcd_show_confirmed(const char* med_name) {
+    lcd_fill_screen(LCD_BLACK);
+    const char* title = "\xE2\x9C\x93 \xE5\xB7\xB2\xE7\xA1\xAE\xE8\xAE\xA4\xE6\x9C\x8D\xE7\x94\xA8"; // "✓ 已确认服用"
+    int tw = cjk_measure_width(title, 1);
+    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 24, title, 1, LCD_GREEN, LCD_BLACK);
+    const char* name = med_name ? med_name : "";
+    int nw = cjk_measure_width(name, 2);
+    int nx = (nw < _lcd_w) ? (_lcd_w - nw) / 2 : 4;
+    lcd_draw_cjk_fb(nx, 72, name, 2, LCD_YELLOW, LCD_BLACK, _lcd_w - 8);
+    const char* tip = "\xE5\xB7\xB2\xE8\xAE\xB0\xE5\xBD\x95"; // "已记录"
+    int sw = cjk_measure_width(tip, 1);
+    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 150, tip, 1, LCD_CYAN, LCD_BLACK);
+}
+
+// Confirm the front-most active (unconfirmed) reminder via physical button.
+static void confirm_active_reminder() {
+    int idx = -1;
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (pending_list[i].active) { idx = i; break; }
+    }
+    if (idx < 0) {
+        Serial.println("[BTN] No pending reminder to confirm");
+        play_test_tone(120);  // short ack, nothing to confirm
+        return;
+    }
+    String id = pending_list[idx].id;
+    String name = pending_list[idx].name;
+
+    // Notify server (sets reminder_logs.status = 'confirmed').
+    // Only mark locally confirmed if the server acknowledged — otherwise we
+    // keep the item in the queue so the user can press again (e.g. WiFi down).
+    String url = String(SERVER_BASE) + "/api/schedules/" + id + "/confirm";
+    HTTPClient http;
+    http.setTimeout(10000);
+    bool ok = false;
+    if (http.begin(url)) {
+        int code = http.PUT("");
+        ok = (code == 200);
+        http.end();
+    }
+    if (!ok) {
+        Serial.printf("[BTN] Confirm upload failed for %s, keep in queue (retry on next press)\n", id.c_str());
+        lcd_show_reminder(name.c_str(), pending_list[idx].dosage.c_str());
+        play_test_tone(120);
+        return;
+    }
+    mark_confirmed_local(id);
+
+    // Remove from pending list (shift remaining down)
+    for (int j = idx; j < MAX_PENDING - 1; j++) pending_list[j] = pending_list[j + 1];
+    pending_list[MAX_PENDING - 1] = PendingItem();
+
+    lcd_show_confirmed(name.c_str());
+    play_test_tone(120); delay(140); play_test_tone(120);
+
+    Serial.printf("[BTN] Confirmed reminder %s (%s)\n", id.c_str(), name.c_str());
+}
+
+// ============================================================
 // Poll medication schedules
 // ============================================================
 static void poll_medication_reminders() {
@@ -1734,39 +1854,49 @@ static void poll_medication_reminders() {
     
     // Check for pending reminders
     if (doc.is<JsonArray>()) {
+        // Deactivate all; re-activate those still due this poll
+        for (int i = 0; i < MAX_PENDING; i++) pending_list[i].active = false;
+
         for (JsonObject reminder : doc.as<JsonArray>()) {
             const char* audio_url = reminder["audioUrl"] | "";
             const char* med_name = reminder["medicationName"] | "unknown";
             const char* dosage = reminder["dosage"] | "";
-            bool played = reminder["played"] | false;
             String id = reminder["id"].as<String>();
-            
-            if (!played && strlen(audio_url) > 0 && !was_played(id)) {
-                Serial.printf("[POLL] Playing reminder for: %s (x%d, +dose)\n", med_name, REMINDER_REPEAT);
-                uint8_t* wav_buf = nullptr;
-                int wav_len = 0;
-                if (download_wav_buffer(String(audio_url), wav_buf, wav_len)) {
-                    lcd_show_reminder(med_name, dosage);
-                    for (int r = 0; r < REMINDER_REPEAT; r++) {
-                        play_wav_data(wav_buf, wav_len);
-                        if (r < REMINDER_REPEAT - 1) {
-                            delay(REMINDER_REPEAT_INTERVAL_MS);
-                        }
-                    }
-                    free(wav_buf);
-                    mark_as_played_local(id);
-                    // Mark as played on server
-                    String mark_url = String(SERVER_BASE) + "/api/schedules/" +
-                                      id + "/played";
-                    HTTPClient http2;
-                    http2.begin(mark_url);
-                    http2.PUT("");
-                    http2.end();
-                } else {
-                    Serial.printf("[POLL] Download failed for %s, will retry next poll\n", med_name);
+
+            // Already confirmed (locally or by server) -> ignore
+            if (strlen(audio_url) == 0 || is_confirmed(id)) continue;
+
+            // Find existing slot (preserve its nag schedule) or allocate new
+            int slot = -1;
+            for (int i = 0; i < MAX_PENDING; i++) {
+                if (pending_list[i].id == id) { slot = i; break; }
+            }
+            if (slot < 0) {
+                for (int i = 0; i < MAX_PENDING; i++) {
+                    if (!pending_list[i].active && pending_list[i].id.isEmpty()) { slot = i; break; }
                 }
             }
+            if (slot < 0) {
+                Serial.println("[POLL] Pending list full, skipping " + id);
+                continue;
+            }
+            pending_list[slot].id = id;
+            pending_list[slot].name = med_name;
+            pending_list[slot].dosage = dosage;
+            pending_list[slot].audioUrl = audio_url;
+            pending_list[slot].active = true;
+            if (pending_list[slot].next_alert == 0) {
+                pending_list[slot].next_alert = millis();  // alert immediately first time
+            }
         }
+
+        // Drop slots no longer due (confirmed elsewhere / dropped by server)
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (!pending_list[i].active) pending_list[i] = PendingItem();
+        }
+
+        // Alert / nag any active, unconfirmed reminder
+        process_alerts();
     }
 }
 
@@ -2191,9 +2321,9 @@ void setup() {
     }
 
     // ---- Step 5: Configure GPIO1 voice button ----
-    Serial.println("[INIT] Step 5: Voice button (GPIO1)");
+    Serial.println("[INIT] Step 5: Confirm button (GPIO1 = 已服)");
     pinMode(VOICE_BTN, INPUT_PULLUP);
-    Serial.println("[INIT] GPIO1 configured (active LOW, top Mute button)");
+    Serial.println("[INIT] GPIO1 configured (active LOW, top 已服 button)");
     
     // ---- Step 6: Brief audio self-test ----
     Serial.println("[INIT] Step 6: Quick speaker test");
@@ -2235,7 +2365,7 @@ void setup() {
     lcd_show_status();
 
     Serial.println("\n[INIT] Setup complete! Starting polling loop...\n");
-    Serial.println("[INIT] Press GPIO1 (top Mute button) to record voice.");
+    Serial.println("[INIT] Press GPIO1 (top button) to confirm 已服.");
 }
 
 // ============================================================
@@ -2246,13 +2376,12 @@ unsigned long last_poll = 0;
 void loop() {
     unsigned long now = millis();
 
-    // ---- Check GPIO1 voice button (active LOW) ----
+    // ---- Check GPIO1 "已服" button (active LOW) ----
     static bool btn_was_pressed = false;
     bool btn_now = (digitalRead(VOICE_BTN) == LOW);
-    if (btn_now && !btn_was_pressed && !voice_recording) {
-        Serial.println("[BTN] GPIO1 pressed! Starting voice recording...");
+    if (btn_now && !btn_was_pressed) {
         delay(50);  // Simple debounce
-        record_and_upload_voice();
+        confirm_active_reminder();
     }
     btn_was_pressed = btn_now;
 
@@ -2275,6 +2404,9 @@ void loop() {
         check_wifi_config();
         last_wifi_cfg = now;
     }
+
+    // Nag any unconfirmed reminder between polls (timer-driven)
+    process_alerts();
 
     delay(50);
 }
