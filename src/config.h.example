@@ -19,3 +19,7 @@
 // 可在设备背面标签查看，或烧录后打开串口助手看启动日志里的
 // "[INIT] WiFi SSID from NVS:" 上方打印的 MAC
 #define DEVICE_MAC      "YOUR_DEVICE_MAC"
+
+// 小程序扫码绑定跳转的 HTTPS 域名（编码进绑定二维码）。main.cpp 内有兜底默认值，
+// 这里可显式覆盖。需与微信公众平台「服务器域名 → request 合法域名」一致。
+#define WEB_BASE        "https://med.biyajie00638.org"

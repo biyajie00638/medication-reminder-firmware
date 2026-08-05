@@ -40,6 +40,12 @@
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "qrcodegen.h"            // M2c: QR 码生成（Nayuki, MIT, 纯C版，枚举为 qrcodegen_Ecc_LOW 避免与 Arduino LOW 宏冲突）
+
+// 小程序扫码绑定跳转的 HTTPS 域名（二维码内容用）。若 config.h 未定义则兜底。
+#ifndef WEB_BASE
+#define WEB_BASE "https://med.biyajie00638.org"
+#endif
 #include "esp_heap_caps.h"
 #include "cjk_font.h"          // v7.70: CJK 16x16 dot-matrix font (GB2312+ASCII)
 
@@ -709,6 +715,7 @@ static uint16_t _lcd_bg = LCD_BLACK;
 static uint8_t  _lcd_textsize = 1;
 static int16_t  _lcd_cursor_x = 0;
 static int16_t  _lcd_cursor_y = 0;
+static bool     g_show_qr = false;   // M2c: 绑定二维码屏幕开关（BOOT 短按切换）
 
 // Forward declarations for LCD show functions
 static void lcd_show_reminder(const char* med_name, const char* dosage);
@@ -1520,7 +1527,115 @@ static void restore_main_screen() {
     lcd_show_status();
 }
 
+// ============================================================
+// M2c: 绑定二维码屏幕
+// 设备联网后向服务端索取一次性 bind-token，连同 MAC 编码成二维码显示，
+// 家属用微信小程序扫码即可绑定（bind.js 解析 ?mac=&token=）。
+// ============================================================
+
+// 向 /api/device/:mac/bind-token 索取一次性绑定 token（5 分钟有效）
+static String fetch_bind_token(const String& url) {
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.setConnectTimeout(5000);
+    if (!http.begin(url)) {
+        Serial.println("[BIND] http.begin failed");
+        return "";
+    }
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("[BIND] GET token failed: %d\n", code);
+        http.end();
+        return "";
+    }
+    String payload = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+        Serial.printf("[BIND] JSON parse failed: %s\n", err.c_str());
+        return "";
+    }
+    const char* t = doc["token"];
+    if (!t) {
+        Serial.println("[BIND] no token field");
+        return "";
+    }
+    return String(t);
+}
+
+// 显示绑定二维码屏幕
+static void show_bind_qr() {
+    lcd_fill_screen(LCD_WHITE);   // 白底，便于扫码
+
+    // 标题："扫码绑定设备"（scale 2）
+    const char* title = "\xE6\x89\xAB\xE7\xA0\x81\xE7\xBB\x91\xE5\xAE\x9A\xE8\xAE\xBE\xE5\xA4\x87";
+    int tw = cjk_measure_width(title, 2);
+    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 4, title, 2, LCD_BLACK, LCD_WHITE);
+
+    if (WiFi.status() != WL_CONNECTED) {
+        const char* msg = "\xE8\xAE\xBE\xE5\xA4\x87\xE6\x9C\xAA\xE8\x81\x94\xE7\xBD\x91\xEF\xBC\x8C\xE8\xAF\xB7\xE5\x85\x88\xE8\xBF\x9EWiFi";
+        int mw = cjk_measure_width(msg, 1);
+        lcd_draw_cjk_fb((_lcd_w - mw) / 2, 110, msg, 1, LCD_BLACK, LCD_WHITE);
+        return;
+    }
+
+    String mac = String(DEVICE_MAC);
+    String tokenUrl = String(SERVER_BASE) + "/api/device/" + mac + "/bind-token";
+    String token = fetch_bind_token(tokenUrl);
+    if (token.isEmpty()) {
+        const char* msg = "\xE8\x8E\xB7\xE5\x8F\x96\xE7\xBB\x91\xE5\xAE\x9A\xE7\xA0\x81\xE5\xA4\xB1\xE8\xB4\xA5\xEF\xBC\x8C\xE8\xAF\xB7\xE9\x87\x8D\xE8\xAF\x95";
+        int mw = cjk_measure_width(msg, 1);
+        lcd_draw_cjk_fb((_lcd_w - mw) / 2, 110, msg, 1, LCD_BLACK, LCD_WHITE);
+        return;
+    }
+
+    // 二维码内容：https://域名/bind?mac=...&token=...（bind.js 只取 ? 后 query）
+    char content[200];
+    snprintf(content, sizeof(content), "%s/bind?mac=%s&token=%s",
+             WEB_BASE, mac.c_str(), token.c_str());
+
+    // 生成 QR（Nayuki 纯C版）
+    static uint8_t qr_buf[qrcodegen_BUFFER_LEN_MAX];
+    static uint8_t qr_temp[qrcodegen_BUFFER_LEN_MAX];
+    bool ok = qrcodegen_encodeText(content, qr_temp, qr_buf,
+                                   qrcodegen_Ecc_LOW,
+                                   qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                   qrcodegen_Mask_AUTO, true);
+    if (!ok) {
+        const char* msg = "\xE4\xBA\x8C\xE7\xBB\xB4\xE7\xA0\x81\xE7\x94\x9F\xE6\x88\x90\xE5\xA4\xB1\xE8\xB4\xA5"; // "二维码生成失败"
+        int mw = cjk_measure_width(msg, 1);
+        lcd_draw_cjk_fb((_lcd_w - mw) / 2, 110, msg, 1, LCD_BLACK, LCD_WHITE);
+        return;
+    }
+    int size = qrcodegen_getSize(qr_buf);
+    int quiet = 4;                       // 静区
+    int total = size + quiet * 2;
+    int box = 190;                       // 二维码区域最大边长(px)
+    int mpx = box / total;
+    if (mpx < 2) mpx = 2;
+    int qpx = mpx * total;
+    int ox = (_lcd_w - qpx) / 2;
+    int oy = 40;
+
+    // 白底已铺好，仅画黑色模块
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            if (qrcodegen_getModule(qr_buf, x, y)) {
+                lcd_fill_rect(ox + (x + quiet) * mpx, oy + (y + quiet) * mpx, mpx, mpx, LCD_BLACK);
+            }
+        }
+    }
+
+    // 底部提示
+    const char* hint = "\xE5\xBE\xAE\xE4\xBF\xA1\xE6\x89\xAB\xE4\xB8\x80\xE6\x89\xAB\xEF\xBC\x8C\xE7\xBB\x91\xE5\xAE\x9A\xE6\x9C\xAC\xE8\xAE\xBE\xE5\xA4\x87";
+    int hw = cjk_measure_width(hint, 1);
+    lcd_draw_cjk_fb((_lcd_w - hw) / 2, oy + qpx + 6, hint, 1, LCD_BLACK, LCD_WHITE);
+}
+
 static void lcd_show_reminder(const char* med_name, const char* dosage) {
+    if (g_show_qr) return;   // M2c: 绑定二维码屏期间不覆盖
     // v7.72d: Full Chinese reminder screen using CJK bitmap font.
     // Layout (landscape 320x240):
     //   y=4:    "⚠ 服药提醒 ⚠"       scale=1 red     (title bar)
@@ -1776,6 +1891,7 @@ static void process_alerts() {
 
 // "已确认" acknowledgement screen
 static void lcd_show_confirmed(const char* med_name) {
+    if (g_show_qr) return;   // M2c: 绑定二维码屏期间不覆盖
     lcd_fill_screen(LCD_BLACK);
     const char* title = "\xE2\x9C\x93 \xE5\xB7\xB2\xE7\xA1\xAE\xE8\xAE\xA4\xE6\x9C\x8D\xE7\x94\xA8"; // "✓ 已确认服用"
     int tw = cjk_measure_width(title, 1);
@@ -2498,21 +2614,30 @@ void loop() {
     }
     btn_was_pressed = btn_now;
 
-    // ---- Force provisioning: BOOT 键(GPIO0) 长按 3s ----
+    // ---- BOOT 键(GPIO0)：短按切换"绑定二维码"屏；长按 3s 进配网 ----
     static unsigned long boot_press_t0 = 0;
     static bool prov_triggered = false;
     if (!prov_triggered) {
         if (digitalRead(0) == LOW) {
             if (boot_press_t0 == 0) boot_press_t0 = now;
-            else if (now - boot_press_t0 > 3000) { prov_triggered = true; run_provisioning_mode(); }
+            else if (now - boot_press_t0 > 3000) {
+                prov_triggered = true;
+                run_provisioning_mode();   // 阻塞直到重启
+            }
         } else {
+            // 释放：3s 内松开 = 短按，切换绑定二维码屏幕
+            if (boot_press_t0 != 0 && (now - boot_press_t0) >= 80 && (now - boot_press_t0) < 3000) {
+                g_show_qr = !g_show_qr;
+                if (g_show_qr) show_bind_qr();
+                else restore_main_screen();
+            }
             boot_press_t0 = 0;
         }
     }
 
-    // Update LCD clock display every second
+    // Update LCD clock display every second（绑定二维码屏期间跳过）
     static unsigned long last_lcd_update = 0;
-    if (now - last_lcd_update > 1000) {
+    if (!g_show_qr && now - last_lcd_update > 1000) {
         lcd_show_time();
         last_lcd_update = now;
     }
