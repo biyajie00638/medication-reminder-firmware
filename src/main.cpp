@@ -1708,6 +1708,7 @@ static bool download_and_play_wav(const String& url) {
 // reminders nag every NAG_INTERVAL_MS until confirmed.
 // ============================================================
 #define NAG_INTERVAL_MS   300000   // 5 min between nag alerts
+#define NAG_CAP           12       // stop audio after ~1h of nags (keep pending on screen)
 #define MAX_PENDING       8
 
 typedef struct {
@@ -1717,6 +1718,8 @@ typedef struct {
     String audioUrl;
     unsigned long next_alert;   // 0 = alert immediately
     bool active;
+    bool first_done;            // false = first (full) alert; true = later gentle 1x nag
+    int  nag_count;             // how many times already nagged (capped)
 } PendingItem;
 
 static PendingItem pending_list[MAX_PENDING];
@@ -1742,18 +1745,28 @@ static void process_alerts() {
         PendingItem& p = pending_list[i];
         if (!p.active) continue;
         if (now < p.next_alert) continue;
+        if (p.nag_count >= NAG_CAP) {
+            // Stop audio nagging after cap, but keep item pending (screen shows it).
+            p.next_alert = now + NAG_INTERVAL_MS;
+            continue;
+        }
         uint8_t* wav_buf = nullptr;
         int wav_len = 0;
         bool ok = download_wav_buffer(p.audioUrl, wav_buf, wav_len);
         if (ok) {
             lcd_show_reminder(p.name.c_str(), p.dosage.c_str());
-            for (int r = 0; r < REMINDER_REPEAT; r++) {
+            // First alert at scheduled time: full repeat (clear). Later nags: gentle 1x.
+            int reps = p.first_done ? 1 : REMINDER_REPEAT;
+            for (int r = 0; r < reps; r++) {
                 play_wav_data(wav_buf, wav_len);
-                if (r < REMINDER_REPEAT - 1) delay(REMINDER_REPEAT_INTERVAL_MS);
+                if (r < reps - 1) delay(REMINDER_REPEAT_INTERVAL_MS);
             }
             free(wav_buf);
+            p.first_done = true;
+            p.nag_count++;
             p.next_alert = now + NAG_INTERVAL_MS;
-            Serial.printf("[ALERT] Nagged %s (%s), next in %d ms\n", p.id.c_str(), p.name.c_str(), NAG_INTERVAL_MS);
+            Serial.printf("[ALERT] Nagged %s (%s) x%d, next in %d ms (nag %d/%d)\n",
+                          p.id.c_str(), p.name.c_str(), reps, NAG_INTERVAL_MS, p.nag_count, NAG_CAP);
         } else {
             p.next_alert = now + 30000;  // retry download soon
             Serial.printf("[ALERT] Download failed for %s, retry in 30s\n", p.name.c_str());
@@ -1776,48 +1789,52 @@ static void lcd_show_confirmed(const char* med_name) {
     lcd_draw_cjk_fb((_lcd_w - sw) / 2, 150, tip, 1, LCD_CYAN, LCD_BLACK);
 }
 
-// Confirm the front-most active (unconfirmed) reminder via physical button.
-static void confirm_active_reminder() {
-    int idx = -1;
+// Confirm ALL currently-active (due & unconfirmed) reminders at once.
+// Pressing 已服 = "I took my meds this round" → clear the whole batch with one press.
+static void confirm_all_due() {
+    int confirmed_any = 0;
     for (int i = 0; i < MAX_PENDING; i++) {
-        if (pending_list[i].active) { idx = i; break; }
-    }
-    if (idx < 0) {
-        Serial.println("[BTN] No pending reminder to confirm");
-        play_test_tone(120);  // short ack, nothing to confirm
-        return;
-    }
-    String id = pending_list[idx].id;
-    String name = pending_list[idx].name;
+        if (!pending_list[i].active) continue;
+        String id = pending_list[i].id;
+        String name = pending_list[i].name;
+        String dosage = pending_list[i].dosage;
 
-    // Notify server (sets reminder_logs.status = 'confirmed').
-    // Only mark locally confirmed if the server acknowledged — otherwise we
-    // keep the item in the queue so the user can press again (e.g. WiFi down).
-    String url = String(SERVER_BASE) + "/api/schedules/" + id + "/confirm";
-    HTTPClient http;
-    http.setTimeout(10000);
-    bool ok = false;
-    if (http.begin(url)) {
-        int code = http.PUT("");
-        ok = (code == 200);
-        http.end();
+        // Notify server (sets reminder_logs.status = 'confirmed').
+        // Only mark locally confirmed if the server acknowledged — otherwise we
+        // keep the item in the queue so the user can press again (e.g. WiFi down).
+        String url = String(SERVER_BASE) + "/api/schedules/" + id + "/confirm";
+        HTTPClient http;
+        http.setTimeout(10000);
+        bool ok = false;
+        if (http.begin(url)) {
+            int code = http.PUT("");
+            ok = (code == 200);
+            http.end();
+        }
+        if (!ok) {
+            Serial.printf("[BTN] Confirm upload failed for %s, keep in queue (retry on next press)\n", id.c_str());
+            lcd_show_reminder(name.c_str(), dosage.c_str());
+            play_test_tone(120);
+            break;  // stop trying further; user can press again, don't hammer server
+        }
+        mark_confirmed_local(id);
+        confirmed_any++;
+        Serial.printf("[BTN] Confirmed %s (%s)\n", id.c_str(), name.c_str());
     }
-    if (!ok) {
-        Serial.printf("[BTN] Confirm upload failed for %s, keep in queue (retry on next press)\n", id.c_str());
-        lcd_show_reminder(name.c_str(), pending_list[idx].dosage.c_str());
-        play_test_tone(120);
-        return;
+
+    // Rebuild pending_list: drop confirmed items, keep the rest
+    int w = 0;
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (pending_list[i].active && !is_confirmed(pending_list[i].id)) {
+            pending_list[w++] = pending_list[i];
+        }
     }
-    mark_confirmed_local(id);
+    for (int i = w; i < MAX_PENDING; i++) pending_list[i] = PendingItem();
 
-    // Remove from pending list (shift remaining down)
-    for (int j = idx; j < MAX_PENDING - 1; j++) pending_list[j] = pending_list[j + 1];
-    pending_list[MAX_PENDING - 1] = PendingItem();
-
-    lcd_show_confirmed(name.c_str());
-    play_test_tone(120); delay(140); play_test_tone(120);
-
-    Serial.printf("[BTN] Confirmed reminder %s (%s)\n", id.c_str(), name.c_str());
+    if (confirmed_any > 0) {
+        lcd_show_confirmed("已确认本轮换药");
+        play_test_tone(120); delay(140); play_test_tone(120);
+    }
 }
 
 // ============================================================
@@ -1887,6 +1904,8 @@ static void poll_medication_reminders() {
             pending_list[slot].dosage = dosage;
             pending_list[slot].audioUrl = audio_url;
             pending_list[slot].active = true;
+            pending_list[slot].first_done = false;
+            pending_list[slot].nag_count = 0;
             if (pending_list[slot].next_alert == 0) {
                 pending_list[slot].next_alert = millis();  // alert immediately first time
             }
@@ -2475,7 +2494,7 @@ void loop() {
     bool btn_now = (digitalRead(VOICE_BTN) == LOW);
     if (btn_now && !btn_was_pressed) {
         delay(50);  // Simple debounce
-        confirm_active_reminder();
+        confirm_all_due();
     }
     btn_was_pressed = btn_now;
 
