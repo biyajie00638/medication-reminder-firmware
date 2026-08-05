@@ -31,6 +31,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <driver/i2s.h>          // Legacy ESP-IDF I2S driver (only one available in this toolchain)
@@ -1990,6 +1992,101 @@ static void check_wifi_config() {
 }
 
 // ============================================================
+// SoftAP 配网模式（零代码 WiFi 设置）
+// 触发：① Step7 连 WiFi 失败  ② BOOT 键(GPIO0) 长按 3s
+// 手机连设备热点 -> 浏览器打开 192.168.4.1 -> 填家庭WiFi -> 写NVS重启
+// 复用现有 save_wifi_creds()（命名空间 wificfg / key ssid,pass,ver）
+// ============================================================
+static WebServer* prov_server = nullptr;
+static DNSServer*  prov_dns = nullptr;
+static String g_ap_ssid, g_ap_pass;
+
+static String prov_mac_last4() {
+    String m = String(DEVICE_MAC);
+    String digits = "";
+    for (char c : m) if (c != ':') digits += c;
+    return digits.substring(digits.length() - 4);
+}
+
+static String prov_gen_pass() {
+    const char* cs = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    String p = "";
+    for (int i = 0; i < 8; i++) p += cs[random(0, (int)strlen(cs))];
+    return p;
+}
+
+static void prov_handle_root() {
+    String html = F(
+        "<!DOCTYPE html><html lang='zh'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>服药提醒配网</title></head><body style='font-family:sans-serif;max-width:360px;margin:16px auto'>"
+        "<h3>服药提醒设备配网</h3>"
+        "<p>请将手机连接本机WiFi：<b>SSID</b> / 密码 <b>PASS</b>，再填写您的家庭WiFi。</p>"
+        "<form method='post' action='/save'>"
+        "家庭WiFi名称(SSID)：<br><input name='ssid' style='width:100%;padding:8px' required><br><br>"
+        "家庭WiFi密码：<br><input name='pass' type='password' style='width:100%;padding:8px'><br><br>"
+        "<button type='submit' style='padding:10px 20px'>保存并连接</button>"
+        "</form></body></html>");
+    html.replace("SSID", g_ap_ssid);
+    html.replace("PASS", g_ap_pass);
+    prov_server->send(200, "text/html; charset=utf-8", html);
+}
+
+static void prov_handle_save() {
+    String ssid = prov_server->arg("ssid");
+    String pass = prov_server->arg("pass");
+    if (ssid.length() == 0) { prov_server->send(400, "text/plain", "SSID empty"); return; }
+    Serial.printf("[PROV] Saving WiFi: %s\n", ssid.c_str());
+    save_wifi_creds(ssid, pass, g_wifi_ver);
+    String html = F(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body style='font-family:sans-serif;text-align:center;margin-top:40px'>"
+        "<h3>已保存，设备正在重启联网…</h3><p>请返回手机WiFi列表，重新连接您的家庭网络。</p></body></html>");
+    prov_server->send(200, "text/html; charset=utf-8", html);
+    delay(800);
+    ESP.restart();
+}
+
+static void run_provisioning_mode() {
+    Serial.println("[PROV] Entering SoftAP provisioning mode");
+    randomSeed(micros());
+    g_ap_ssid = "MedRemind-" + prov_mac_last4();
+    g_ap_pass = prov_gen_pass();
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(g_ap_ssid.c_str(), g_ap_pass.c_str());
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("[PROV] AP up: SSID=%s PASS=%s IP=%s\n", g_ap_ssid.c_str(), g_ap_pass.c_str(), apIP.toString().c_str());
+
+    lcd_fill_screen(LCD_BLACK);
+    lcd_draw_cjk_fb(8, 6,  "配网模式", 2, LCD_WHITE, LCD_BLACK);
+    lcd_draw_cjk_fb(8, 40, "WiFi:", 1, LCD_WHITE, LCD_BLACK);
+    lcd_draw_cjk_fb(64, 40, g_ap_ssid.c_str(), 1, LCD_YELLOW, LCD_BLACK);
+    lcd_draw_cjk_fb(8, 62, "密码:", 1, LCD_WHITE, LCD_BLACK);
+    lcd_draw_cjk_fb(64, 62, g_ap_pass.c_str(), 1, LCD_YELLOW, LCD_BLACK);
+    lcd_draw_cjk_fb(8, 92, "连此WiFi后浏览器打开", 1, LCD_CYAN, LCD_BLACK);
+    lcd_draw_cjk_fb(8, 112, "192.168.4.1", 1, LCD_CYAN, LCD_BLACK);
+
+    prov_dns = new DNSServer();
+    prov_dns->setErrorReplyCode(DNSReplyCode::NoError);
+    prov_dns->start(53, "*", apIP);
+
+    prov_server = new WebServer(80);
+    prov_server->on("/", prov_handle_root);
+    prov_server->on("/save", HTTP_POST, prov_handle_save);
+    prov_server->on("/generate_204", HTTP_GET, prov_handle_root);
+    prov_server->on("/hotspot-detect.html", HTTP_GET, prov_handle_root);
+    prov_server->onNotFound(prov_handle_root);
+    prov_server->begin();
+    Serial.println("[PROV] Captive portal ready, awaiting client...");
+
+    while (true) {
+        prov_dns->processNextRequest();
+        prov_server->handleClient();
+        delay(10);
+    }
+}
+
+// ============================================================
 // Print all ES8311 registers (debug)
 // ============================================================
 static void es8311_dump_regs() {
@@ -2324,6 +2421,7 @@ void setup() {
     Serial.println("[INIT] Step 5: Confirm button (GPIO1 = 已服)");
     pinMode(VOICE_BTN, INPUT_PULLUP);
     Serial.println("[INIT] GPIO1 configured (active LOW, top 已服 button)");
+    pinMode(0, INPUT_PULLUP);  // BOOT 键：长按 3s 进入配网模式
     
     // ---- Step 6: Brief audio self-test ----
     Serial.println("[INIT] Step 6: Quick speaker test");
@@ -2351,12 +2449,8 @@ void setup() {
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
         Serial.println("[INIT] NTP time sync initiated (async)");
     } else {
-        Serial.println("\n[INIT] WiFi connection FAILED!");
-        lcd_set_text_size(1);
-        lcd_set_text_color(LCD_RED, LCD_BLACK);
-        lcd_fill_rect(80, 140, 180, 16, LCD_BLACK);
-        lcd_set_cursor(80, 140);
-        lcd_print("WiFi FAILED!");
+        Serial.println("\n[INIT] WiFi connection FAILED, entering provisioning mode");
+        run_provisioning_mode();
     }
 
     // Clear boot screen before entering normal display mode
@@ -2384,6 +2478,18 @@ void loop() {
         confirm_active_reminder();
     }
     btn_was_pressed = btn_now;
+
+    // ---- Force provisioning: BOOT 键(GPIO0) 长按 3s ----
+    static unsigned long boot_press_t0 = 0;
+    static bool prov_triggered = false;
+    if (!prov_triggered) {
+        if (digitalRead(0) == LOW) {
+            if (boot_press_t0 == 0) boot_press_t0 = now;
+            else if (now - boot_press_t0 > 3000) { prov_triggered = true; run_provisioning_mode(); }
+        } else {
+            boot_press_t0 = 0;
+        }
+    }
 
     // Update LCD clock display every second
     static unsigned long last_lcd_update = 0;
