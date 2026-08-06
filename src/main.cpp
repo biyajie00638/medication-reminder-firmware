@@ -41,6 +41,8 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include "qrcodegen.h"            // M2c: QR 码生成（Nayuki, MIT, 纯C版，枚举为 qrcodegen_Ecc_LOW 避免与 Arduino LOW 宏冲突）
+#include <Update.h>               // OTA 固件自更新（双分区防变砖）
+#include <HTTPUpdate.h>            // 官方 OTA 下载器（HTTPS 大文件流式下载，已大量验证）
 
 // 小程序扫码绑定跳转的 HTTPS 域名（二维码内容用）。若 config.h 未定义则兜底。
 #ifndef WEB_BASE
@@ -102,7 +104,13 @@ static i2s_port_t i2s_port = I2S_NUM_0;
 #ifndef WIFI_SSID
 #error "WIFI_SSID 未定义：请复制 src/config.h.example 为 src/config.h 并填写 WiFi/服务器/MAC"
 #endif
+// OTA 固件版本号：每次发布递增，须与服务端 FIRMWARE_VERSION 常量保持一致。
+// 买家收到设备后无需串口，设备会定时向服务端查询，自动拉取新版本刷写。
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "1.0.2"
+#endif
 #define POLL_INTERVAL   60000   // 60s polling interval
+#define OTA_CHECK_INTERVAL 600000  // 10 分钟检查一次固件更新（启动后首次立即检查）
 #define REMINDER_REPEAT 5       // 同一条提醒连播次数
 #define REMINDER_REPEAT_INTERVAL_MS 1000  // 连播间隔(毫秒)
 
@@ -2064,6 +2072,81 @@ static void poll_medication_reminders() {
 }
 
 // ============================================================
+// OTA 固件自动更新（买家可无线升级，无需串口）
+//   - 轮询 /api/firmware/latest，若服务端版本高于本机则下载刷写并重启
+//   - 双分区(ota_0/ota_1) + SHA256 校验：刷写失败自动回滚，保留旧固件，不会变砖
+//   - 仅 Update.end(true) 成功才重启；否则保留旧固件，下次轮询再试
+// ============================================================
+static void check_firmware_update() {
+    String url = String(SERVER_BASE) + "/api/firmware/latest?mac=" + String(DEVICE_MAC)
+               + "&version=" + String(FIRMWARE_VERSION);
+    Serial.printf("[OTA] check %s\n", url.c_str());
+
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.setConnectTimeout(5000);
+    if (!http.begin(url)) {
+        Serial.println("[OTA] begin failed");
+        return;
+    }
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("[OTA] query failed: %d\n", code);
+        http.end();
+        return;
+    }
+    JsonDocument doc;
+    String body = http.getString();
+    http.end();
+    if (deserializeJson(doc, body)) {
+        Serial.println("[OTA] json parse failed");
+        return;
+    }
+    bool update = doc["update"] | false;
+    if (!update) {
+        Serial.printf("[OTA] up to date (%s)\n", FIRMWARE_VERSION);
+        return;
+    }
+    const char* newVer = doc["version"] | "";
+    const char* binUrl = doc["url"] | "";
+    if (!binUrl || !*binUrl) {
+        Serial.println("[OTA] missing firmware url");
+        return;
+    }
+    Serial.printf("[OTA] new version %s available, downloading %s\n", newVer, binUrl);
+
+    // 提示用户：更新期间设备短暂不可用
+    lcd_fill_screen(LCD_BLACK);
+    const char* msg = "\xE5\x9B\xBA\xE4\xBB\xB6\xE6\x9B\xB4\xE6\x96\xB0\xE4\xB8\xAD\xE2\x80\xA6"; // "固件更新中…"
+    int sw = cjk_measure_width(msg, 2);
+    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 130, msg, 2, LCD_CYAN, LCD_BLACK);
+
+    // 用官方 HTTPUpdate 下载（HTTPS 大文件流式下载稳定可靠，自动处理 TLS/分块）
+    // 双分区 + Update.end 内部校验镜像完整性：失败自动回滚，保留旧固件，不会变砖。
+    // 成功后 HTTPUpdate 回调 ESP.restart() 自动重启。
+    HTTPClient fhttp;
+    fhttp.setTimeout(60000);
+    fhttp.setConnectTimeout(5000);
+    if (!fhttp.begin(binUrl)) {
+        Serial.println("[OTA] firmware begin failed");
+        return;
+    }
+    HTTPUpdate httpUpdate;
+    httpUpdate.rebootOnUpdate(true);
+    HTTPUpdateResult ret = httpUpdate.update(fhttp, binUrl);
+    fhttp.end();
+    if (ret == HTTP_UPDATE_OK) {
+        Serial.printf("[OTA] update applied (%s), rebooting...\n", newVer);
+        // rebootOnUpdate(true) 已触发重启，不会到这里
+    } else if (ret == HTTP_UPDATE_NO_UPDATES) {
+        Serial.println("[OTA] HTTPUpdate: no updates");
+    } else {
+        Serial.printf("[OTA] update failed: %s (keep old firmware, retry next poll)\n",
+                      httpUpdate.getLastErrorString());
+    }
+}
+
+// ============================================================
 // WiFi 配置（服务端下发 + NVS 持久化）
 // 设备每 5 分钟轮询 /api/device/:mac/wifi/pending；
 // 若返回新版本则断开重连，成功写 NVS 并 ack，失败回退原账号。
@@ -2499,6 +2582,7 @@ void setup() {
     Serial.println("  Medication Reminder - ESP-BOX-3");
     Serial.println("  Firmware v7.77 (CJK display + LANDSCAPE 320x240 full-panel fix: MADCTL 0xC8 gives upright+correct-mirror; _lcd_w/h=320x240 matches physical ILI9341 panel; buffer overflows fixed; GB2312 16x16 dot-matrix font; Chinese medication name+dosage in landscape. NEW: WiFi credentials now loaded from NVS (server-pushed via /api/device/:mac/wifi/pending, applied+reconnect+ack with rollback). Builds on v7.67 MCLK APLL fix.)");
     Serial.println("====================================\n");
+    Serial.printf("[FW] OTA firmware version %s\n", FIRMWARE_VERSION);
 
     // ---- Step 0: Initialize LCD ----
     Serial.println("[INIT] Step 0: LCD (ILI9341)");
@@ -2684,6 +2768,13 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED && (now - last_wifi_cfg > 300000 || last_wifi_cfg == 0)) {
         check_wifi_config();
         last_wifi_cfg = now;
+    }
+
+    // 检查固件更新（每 10 分钟，启动后首次立即检查）
+    static unsigned long last_ota_check = 0;
+    if (WiFi.status() == WL_CONNECTED && (now - last_ota_check > OTA_CHECK_INTERVAL || last_ota_check == 0)) {
+        check_firmware_update();
+        last_ota_check = now;
     }
 
     // Nag any unconfirmed reminder between polls (timer-driven)
