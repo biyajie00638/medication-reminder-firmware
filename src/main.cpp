@@ -107,10 +107,17 @@ static i2s_port_t i2s_port = I2S_NUM_0;
 // OTA 固件版本号：每次发布递增，须与服务端 FIRMWARE_VERSION 常量保持一致。
 // 买家收到设备后无需串口，设备会定时向服务端查询，自动拉取新版本刷写。
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.1.2"
 #endif
 #define POLL_INTERVAL   60000   // 60s polling interval
 #define OTA_CHECK_INTERVAL 600000  // 10 分钟检查一次固件更新（启动后首次立即检查）
+
+// 运行时从硬件读取的本机 MAC（WiFi.macAddress()），无需逐台烧录写死 MAC
+static String g_deviceMac;
+// 设备令牌：服务端为每个设备生成的唯一令牌，用于轮询/确认接口的设备身份校验（防凭 MAC 拉取药名）
+static String g_deviceToken;
+static void load_device_token();
+static void save_device_token(const String &tok);
 #define REMINDER_REPEAT 5       // 同一条提醒连播次数
 #define REMINDER_REPEAT_INTERVAL_MS 1000  // 连播间隔(毫秒)
 
@@ -1945,6 +1952,7 @@ static void confirm_all_due() {
         // Only mark locally confirmed if the server acknowledged — otherwise we
         // keep the item in the queue so the user can press again (e.g. WiFi down).
         String url = String(SERVER_BASE) + "/api/schedules/" + id + "/confirm";
+        if (g_deviceToken.length()) url += "?token=" + g_deviceToken;
         HTTPClient http;
         http.setTimeout(10000);
         bool ok = false;
@@ -1992,6 +2000,7 @@ static void confirm_all_due() {
 // ============================================================
 static void poll_medication_reminders() {
     String url = String(SERVER_BASE) + "/api/schedules?mac=" + g_deviceMac;
+    if (g_deviceToken.length()) url += "&token=" + g_deviceToken;
     Serial.printf("[POLL] Checking schedules: %s\n", url.c_str());
     
     HTTPClient http;
@@ -2009,7 +2018,14 @@ static void poll_medication_reminders() {
         http.end();
         return;
     }
-    
+
+    // 设备令牌：服务端在首次/旧固件无 token 时通过响应头下发，本地持久化后下次轮询携带
+    String dtok = http.header("X-Device-Token");
+    if (dtok.length()) {
+        save_device_token(dtok);
+        Serial.printf("[POLL] Received device token (len=%d), saved\n", dtok.length());
+    }
+
     String response = http.getString();
     http.end();
     
@@ -2155,7 +2171,6 @@ static void check_firmware_update() {
 static String g_cur_ssid = WIFI_SSID;
 static String g_cur_pass = WIFI_PASS;
 static int    g_wifi_ver = 0;
-static String g_deviceMac;   // 运行时从硬件读取，无需逐台烧录写死 MAC
 
 static void load_wifi_creds(String &ssid, String &pass) {
     Preferences prefs;
@@ -2174,6 +2189,22 @@ static void save_wifi_creds(const String &ssid, const String &pass, int ver) {
     prefs.putInt("ver", ver);
     prefs.end();
     g_wifi_ver = ver;
+}
+
+// 设备令牌的本地持久化（与 WiFi 凭据共用 NVS 命名空间，独立 key "devtok"）
+static void load_device_token() {
+    Preferences prefs;
+    prefs.begin(WIFI_CFG_NS, true);
+    g_deviceToken = prefs.getString("devtok", "");
+    prefs.end();
+}
+static void save_device_token(const String &tok) {
+    if (tok.length() == 0) return;
+    Preferences prefs;
+    prefs.begin(WIFI_CFG_NS, false);
+    prefs.putString("devtok", tok);
+    prefs.end();
+    g_deviceToken = tok;
 }
 
 static void ack_wifi_config(int ver, bool ok, const char* err) {
@@ -2683,6 +2714,8 @@ void setup() {
     g_cur_ssid = wifi_ssid; g_cur_pass = wifi_pass;
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     g_deviceMac = WiFi.macAddress();   // 运行时读取本机 MAC，量产同二进制即可
+    g_deviceMac.toLowerCase();         // 统一小写，兼容历史数据（服务端 schedule 等均以小写 MAC 存储）
+    load_device_token();               // 读取本地持久化的设备令牌（首次为空，轮询时由服务端下发）
     Serial.printf("[INIT] Device MAC (auto-read): %s\n", g_deviceMac.c_str());
     int wifi_attempts = 0;
     while (WiFi.status() != WL_CONNECTED && wifi_attempts < 30) {
@@ -2695,6 +2728,7 @@ void setup() {
         Serial.printf("\n[INIT] WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
         lcd_show_wifi_connected(WiFi.localIP().toString().c_str());
         g_deviceMac = WiFi.macAddress();   // 连接成功后再次确认 MAC 已就绪
+        g_deviceMac.toLowerCase();         // 统一小写，兼容历史数据
         Serial.printf("[INIT] Device MAC (connected): %s\n", g_deviceMac.c_str());
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
         Serial.println("[INIT] NTP time sync initiated (async)");
