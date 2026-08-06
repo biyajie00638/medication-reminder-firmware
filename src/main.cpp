@@ -716,6 +716,8 @@ static uint8_t  _lcd_textsize = 1;
 static int16_t  _lcd_cursor_x = 0;
 static int16_t  _lcd_cursor_y = 0;
 static bool     g_show_qr = false;   // M2c: 绑定二维码屏幕开关（BOOT 短按切换）
+static bool     g_showing_confirmed = false;  // 已确认屏显示中（抑制时钟覆盖）
+static unsigned long g_confirmed_until = 0;    // 已确认屏自动恢复时间戳
 
 // Forward declarations for LCD show functions
 static void lcd_show_reminder(const char* med_name, const char* dosage);
@@ -1853,6 +1855,10 @@ static void mark_confirmed_local(const String& id) {
     confirmed_idx = (confirmed_idx + 1) % MAX_CONFIRMED_IDS;
 }
 
+// 确认引导语音频（一次性下载缓存，避免每次播报重复下载；固定文案，永久有效）
+uint8_t* g_confirm_prompt_buf = nullptr;
+int g_confirm_prompt_len = 0;
+
 // Alert (and re-nag) any active, unconfirmed reminder whose timer is due.
 static void process_alerts() {
     unsigned long now = millis();
@@ -1877,6 +1883,15 @@ static void process_alerts() {
                 if (r < reps - 1) delay(REMINDER_REPEAT_INTERVAL_MS);
             }
             free(wav_buf);
+            // 播报末尾追加"请按确认键"引导语（仅一次，降低老人漏确认率）
+            if (!g_confirm_prompt_buf) {
+                // 首次：下载并缓存引导语音频
+                download_wav_buffer(String(SERVER_BASE) + "/api/audio/__CONFIRM_PROMPT__",
+                                    g_confirm_prompt_buf, g_confirm_prompt_len);
+            }
+            if (g_confirm_prompt_buf) {
+                play_wav_data(g_confirm_prompt_buf, g_confirm_prompt_len);
+            }
             p.first_done = true;
             p.nag_count++;
             p.next_alert = now + NAG_INTERVAL_MS;
@@ -1895,14 +1910,17 @@ static void lcd_show_confirmed(const char* med_name) {
     lcd_fill_screen(LCD_BLACK);
     const char* title = "\xE2\x9C\x93 \xE5\xB7\xB2\xE7\xA1\xAE\xE8\xAE\xA4\xE6\x9C\x8D\xE7\x94\xA8"; // "✓ 已确认服用"
     int tw = cjk_measure_width(title, 1);
-    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 24, title, 1, LCD_GREEN, LCD_BLACK);
+    lcd_draw_cjk_fb((_lcd_w - tw) / 2, 20, title, 1, LCD_GREEN, LCD_BLACK);
     const char* name = med_name ? med_name : "";
     int nw = cjk_measure_width(name, 2);
     int nx = (nw < _lcd_w) ? (_lcd_w - nw) / 2 : 4;
-    lcd_draw_cjk_fb(nx, 72, name, 2, LCD_YELLOW, LCD_BLACK, _lcd_w - 8);
+    lcd_draw_cjk_fb(nx, 80, name, 2, LCD_YELLOW, LCD_BLACK, _lcd_w - 8);
     const char* tip = "\xE5\xB7\xB2\xE8\xAE\xB0\xE5\xBD\x95"; // "已记录"
     int sw = cjk_measure_width(tip, 1);
-    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 150, tip, 1, LCD_CYAN, LCD_BLACK);
+    lcd_draw_cjk_fb((_lcd_w - sw) / 2, 170, tip, 1, LCD_CYAN, LCD_BLACK);
+    // 标记已确认屏状态，抑制 loop() 时钟刷新覆盖
+    g_showing_confirmed = true;
+    g_confirmed_until = millis() + 4000;  // 4秒后自动恢复主屏
 }
 
 // Confirm ALL currently-active (due & unconfirmed) reminders at once.
@@ -1950,6 +1968,14 @@ static void confirm_all_due() {
     if (confirmed_any > 0) {
         lcd_show_confirmed("已确认本轮换药");
         play_test_tone(120); delay(140); play_test_tone(120);
+    } else {
+        // 无待确认项：给轻反馈，避免静默让用户以为按键坏了
+        lcd_fill_screen(LCD_BLACK);
+        const char* tip = "\xE6\x9A\x82\xE6\x97\xA0\xE5\xBE\x85\xE6\x9C\x8D\xE8\x8D\xAF\xE6\x8F\x90\xE9\x86\x92"; // "暂无可服药提醒"
+        int sw = cjk_measure_width(tip, 2);
+        lcd_draw_cjk_fb((_lcd_w - sw) / 2, 120, tip, 2, LCD_CYAN, LCD_BLACK);
+        g_showing_confirmed = true;
+        g_confirmed_until = millis() + 2000;  // 2秒后恢复主屏
     }
 }
 
@@ -2635,9 +2661,14 @@ void loop() {
         }
     }
 
-    // Update LCD clock display every second（绑定二维码屏期间跳过）
+    // Update LCD clock display every second（绑定二维码/已确认屏期间跳过）
     static unsigned long last_lcd_update = 0;
-    if (!g_show_qr && now - last_lcd_update > 1000) {
+    // 已确认屏超时自动恢复
+    if (g_showing_confirmed && now >= g_confirmed_until) {
+        g_showing_confirmed = false;
+        restore_main_screen();
+    }
+    if (!g_show_qr && !g_showing_confirmed && now - last_lcd_update > 1000) {
         lcd_show_time();
         last_lcd_update = now;
     }
