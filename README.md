@@ -1,22 +1,24 @@
-# 用药提醒机器人（固件）
+# 用药提醒机器人 · 固件（ESP32-S3-BOX-3）
 
-一个给长辈用的**离线语音用药提醒终端**的 ESP32 固件。设备每隔一段时间从服务端拉取当天的服药计划，
-到点在 **LCD 屏显示药名/剂量** 并 **循环语音播报**，支持按键语音确认“已服药”；当家里 WiFi 变更时，
-无需插线，服务端下发新账号后设备自动重连。
+给**长辈 / 慢病老人**用的离线语音用药提醒终端固件。到点**亮屏显示药名/剂量**并**循环语音播报**，
+老人按一下顶部「已服」键即确认；家里 WiFi 变更时无需插线，服务端下发新账号设备自动重连；
+支持**固件远程 OTA** 与**零代码配网**。
 
-> 配套服务端仓库：[medication-server](https://github.com/biyajie00638/medication-server-)
+> 配套服务端：[medication-server](https://github.com/biyajie00638/medication-server-)（管理服药计划、TTS 语音、机群、告警、OTA）
 
 ---
 
 ## ✨ 功能特性
 
-- 🖥️ **320×240 横屏 LCD** 显示时间、药名、剂量与提示（中文点阵，16×16 单色）
-- 🔊 **语音播报**：每条提醒循环播放 5 次，使用服务端 edge-tts 中文语音
-- ⏰ **定时拉取**：每 60 秒轮询服务端，自动匹配当前时段的服药计划
-- ✅ **语音确认**：按顶部按键录音，上传服务端 ASR 识别“已服药”后标记完成
-- 📶 **WiFi 远程重配置**：服务端网页改 WiFi 账号 → 设备下次轮询自动重连（连不上自动回退，不变砖）
-- 💾 **NVS 持久化**：WiFi 凭据存于 ESP32 Flash，断电不丢
-- 🔧 **时区正确**：服务端已固化 `Asia/Shanghai` 时区，提醒时间不再错 8 小时
+- 🖥️ **320×240 横屏 LCD**：显示时间、药名、剂量与提示（中文 16×16 点阵，离线字库）
+- 🔊 **语音播报**：每条提醒循环播放 5 次（后续催报仅 1 遍轻提醒），服务端 edge-tts 中文语音
+- ✅ **物理「已服」确认**：按顶部键（GPIO1，active LOW）确认整轮待服药物；待确认队列每 5 分钟催报，确认仅在本机按键时生效
+- 📢 **语音引导**：播报末尾提示「请按设备顶部的确认键，确认已服药」
+- 📶 **零代码配网（SoftAP）**：WiFi 连不上，或 **长按 BOOT 键 3 秒**进入热点 `MedRemind-XXXX`，手机连上填家庭 WiFi 即联网
+- 🔗 **扫码绑定家属**：**短按 BOOT 键（<3 秒）**屏幕显示绑定二维码，家属微信扫码即绑定
+- 💾 **NVS 持久化 + 服务端推送重连**：WiFi 凭据存 Flash；服务端改 WiFi 后设备自动重连，连不上回退原账号（不变砖）
+- 🛰️ **固件 OTA**：每 10 分钟查服务端，新版本**静默自动升级**（双分区 ota_0/ota_1 + otadata 防变砖）
+- 🏭 **量产友好**：开机**自动读取硬件 MAC**（`WiFi.macAddress()`），一份编译产物即可烧录所有设备，无需逐台写 MAC
 
 ---
 
@@ -24,120 +26,76 @@
 
 | 部件 | 说明 |
 |------|------|
-| 主控 | **ESP32-S3-BOX-3**（乐鑫官方开发板，ESP32-S3） |
+| 主控 | **ESP32-S3-BOX-3**（乐鑫官方开发板） |
 | 屏幕 | 板载 ILI9341，物理 320×240 横屏 |
 | 音频 | ES8311（扬声器 DAC）+ ES7210（麦克风 ADC） |
 | 存储 | 板载 PSRAM（中文点阵字库位于 PROGMEM） |
+
+按键：BOOT（GPIO0，烧录/配网/绑定）、顶部「已服」键（GPIO1）。
 
 > 本项目针对 ESP32-S3-BOX-3 调试；其他 ESP32-S3 + ILI9341 + ES8311/ES7210 板卡可参考移植。
 
 ---
 
-## 📁 目录结构
-
-```
-medication-reminder-firmware/
-├── src/
-│   ├── main.cpp            # 主固件（WiFi/NVS、轮询、LCD、音频、语音确认）
-│   ├── config.h.example    # 配置模板（复制为 config.h 后填写）
-│   ├── cjk_font.h          # 中文 16×16 点阵字库（离线生成，~1.6MB PROGMEM）
-│   └── lcd_* / es8311_* / es7210_*  # 屏幕与音频驱动
-├── releases/
-│   └── v7.77/              # 预编译固件（bootloader/partitions/firmware.bin）
-├── platformio.ini
-└── README.md
-```
-
----
-
 ## 🚀 快速开始
 
-### 1. 准备工具
+### 1. 准备
 - 安装 [PlatformIO](https://platformio.org/)（VS Code 插件或命令行）
-- 用 USB 连接 ESP32-S3-BOX-3
+- USB 连接 ESP32-S3-BOX-3
 
-### 2. 配置私人凭据
+### 2. 配置
 ```bash
 cd src
 cp config.h.example config.h
-# 编辑 config.h，填入你的 WiFi / 服务端地址 / 设备 MAC
+# 编辑 config.h，至少填 SERVER_BASE（你的服务端地址）
 ```
-
-`config.h` 字段说明：
-
 | 宏 | 含义 | 示例 |
 |----|------|------|
-| `WIFI_SSID` | 设备要连的 WiFi 名称 | `"my_home_wifi"` |
-| `WIFI_PASS` | WiFi 密码 | `"password"` |
-| `SERVER_BASE` | 服务端地址（IP:端口） | `"http://192.168.1.100:3000"` |
-| `DEVICE_MAC` | 本机 MAC（设备背面或串口日志） | `"E8:F6:0A:A8:C3:BC"` |
+| `WIFI_SSID` / `WIFI_PASS` | 出厂预连 WiFi（可留空，首次开机用 SoftAP 配网） | `"my_home_wifi"` |
+| `SERVER_BASE` | 服务端地址（IP:端口 或 HTTPS 域名） | `"https://med.biyajie00638.org"` |
+| `DEVICE_MAC` | **可选**。不填则固件自动读取硬件 MAC（量产推荐留空） | `"E8:F6:0A:…"` |
+| `WEB_BASE` | 绑定二维码跳转域名（需与微信合法域名一致） | `"https://med.biyajie00638.org"` |
 
-> ⚠️ `config.h` 已被 `.gitignore` 忽略，**不会**随仓库公开。
+> ⚠️ `src/config.h` 已被 `.gitignore` 忽略，**不会**随仓库公开。
 
 ### 3. 编译并烧录
 ```bash
-# 编译
 platformio run
-
-# 烧录（按实际端口修改，Windows 常见 COM6）
-platformio run --target upload --upload-port COM6
+platformio run --target upload --upload-port COM6   # Windows 常见 COM6
 ```
-
-### 4. 关于固件二进制
-
-本仓库**不提供预编译固件**。固件内含有你的 WiFi 密码、服务器地址等设备专属配置，
-无法直接通用，也不应随公开仓库发布。请按上面的步骤用你自己的 `config.h` 本地编译：
-
-- 编译产物在 `.pio/build/esp32s3box3/`，含 `bootloader.bin` / `partitions.bin` / `firmware.bin`
-- 如需用 esptool 单独烧录（偏移同上）：
-
-```bash
-esptool.py --chip esp32s3 \
-  --before=default_reset --after=hard_reset \
-  write_flash --flash_mode dio --flash_size 16MB \
-  0x0       .pio/build/esp32s3box3/bootloader.bin \
-  0x8000    .pio/build/esp32s3box3/partitions.bin \
-  0x10000   .pio/build/esp32s3box3/firmware.bin
-```
-
-> 🔒 **安全提示**：`src/config.h` 已被 `.gitignore` 忽略，提交前请确认其中不含真实凭据；
-> 若曾把含密码的固件推到过别处，请及时修改对应 WiFi / 服务器密码。
+编译产物在 `.pio/build/esp32s3box3/`（`bootloader.bin` / `partitions.bin` / `firmware.bin`）。
+可用 esptool 单独烧录（偏移 0x0 / 0x8000 / 0x10000）。
 
 ---
 
-## 🌐 服务端
+## 🏭 量产 / 多设备运营（有人订购时）
 
-固件需要配套的服务端（管理服药计划、TTS 语音、语音识别、设备 WiFi 下发）。
-请参见 [medication-server](https://github.com/biyajie00638/medication-server-) 仓库，
-按其中的说明用 Docker 部署。
-
-服务端关键接口（设备侧自动调用，无需手动）：
-
-| 接口 | 作用 |
-|------|------|
-| `GET /api/schedules?mac=...` | 拉取当前时段服药计划 |
-| `PUT /api/schedules/:id/played` | 标记已播放 |
-| `GET /api/audio/:name` | 下载 TTS 语音 |
-| `POST /api/voice?mac=...` | 上传录音做 ASR + 意图识别 |
-| `GET/POST /api/device/:mac/wifi/pending\|ack` | WiFi 远程重配置的拉取/回执 |
+1. **一份固件烧所有设备**：`config.h` 里只设 `SERVER_BASE`（与 `WEB_BASE`），`DEVICE_MAC` 留空。
+   固件开机自动读 MAC，烧录同一 `firmware.bin` 到每台板子即可。
+2. **寄到家里自助配网**：用户长按 BOOT 3 秒进热点，手机填家庭 WiFi → 设备联网并**自动在服务端注册**
+   （后台机群视图出现该设备，初始名称=MAC）。
+3. **运营方在后台改名 + 配方案**：在「设备机群」里把 MAC 改成可读备注（如「爸-卧室」），设置服药方案；
+   让用户短按 BOOT 显二维码，家属扫码绑定微信，即可收漏服/离线告警。
+4. **后续发版零运维**：服务端放新 `firmware.bin` + `sha256`，所有设备 ≤10 分钟静默 OTA 升级。
 
 ---
 
-## 📶 WiFi 远程重配置
+## 🛰️ OTA 发布流程
 
-1. 打开服务端网页（默认 `http://<服务器IP>:3000`），登录后选设备
-2. 在「📶 设备 WiFi 设置」卡片填入新的 SSID / 密码，点保存下发
-3. 设备下次轮询（≤5 分钟）检测到新配置 → 断开重连
-   - 连上：保存 NVS 并上报成功
-   - 连不上：**自动回退原 WiFi**，不会变砖
+1. 改固件 `FIRMWARE_VERSION` 宏 → `platformio run` 生成 `firmware.bin`
+2. 改服务端 `server.js` 的 `FIRMWARE_VERSION` 常量（**须与固件一致**）
+3. 放 `firmware.bin` + `firmware.bin.sha256` 到服务端 `public/firmware/`，部署服务端
+4. 设备下次轮询自动拉取刷写；双分区，失败自动回滚
 
 ---
 
 ## 🔖 版本
 
-- `v7.77`：WiFi 凭据 NVS 持久化 + 服务端推送远程重配置（应用/重连/回执，带原账号回退）
-- `v7.76`：320×240 横屏满屏（灰条彻底解决）+ 中文药名/剂量显示
-- `v7.67`：LCD 时间/提醒显示 + 语音播报 + 自动日志
+- `v1.1.0`：MAC 运行时自动读取（量产同二进制）；服务端设备改名接口；后台机群视图配套
+- `v1.0.2`：固件 OTA 自更新（HTTPUpdate HTTPS 流式 + 双分区防变砖）
+- `v1.0.1`：播报末尾「请按确认键」引导；一次按键确认整轮 + 轻催报优化
+- `v1.0.0`：SoftAP 零代码配网 + BOOT 短按绑定二维码 + 物理「已服」确认键
+- `v7.77`：320×240 横屏满屏 + 中文药名/剂量显示 + NVS WiFi 持久化
 
 ---
 

@@ -107,7 +107,7 @@ static i2s_port_t i2s_port = I2S_NUM_0;
 // OTA 固件版本号：每次发布递增，须与服务端 FIRMWARE_VERSION 常量保持一致。
 // 买家收到设备后无需串口，设备会定时向服务端查询，自动拉取新版本刷写。
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "1.0.2"
+#define FIRMWARE_VERSION "1.1.0"
 #endif
 #define POLL_INTERVAL   60000   // 60s polling interval
 #define OTA_CHECK_INTERVAL 600000  // 10 分钟检查一次固件更新（启动后首次立即检查）
@@ -1591,7 +1591,7 @@ static void show_bind_qr() {
         return;
     }
 
-    String mac = String(DEVICE_MAC);
+    String mac = g_deviceMac;
     String tokenUrl = String(SERVER_BASE) + "/api/device/" + mac + "/bind-token";
     String token = fetch_bind_token(tokenUrl);
     if (token.isEmpty()) {
@@ -1991,7 +1991,7 @@ static void confirm_all_due() {
 // Poll medication schedules
 // ============================================================
 static void poll_medication_reminders() {
-    String url = String(SERVER_BASE) + "/api/schedules?mac=" + String(DEVICE_MAC);
+    String url = String(SERVER_BASE) + "/api/schedules?mac=" + g_deviceMac;
     Serial.printf("[POLL] Checking schedules: %s\n", url.c_str());
     
     HTTPClient http;
@@ -2078,7 +2078,7 @@ static void poll_medication_reminders() {
 //   - 仅 Update.end(true) 成功才重启；否则保留旧固件，下次轮询再试
 // ============================================================
 static void check_firmware_update() {
-    String url = String(SERVER_BASE) + "/api/firmware/latest?mac=" + String(DEVICE_MAC)
+    String url = String(SERVER_BASE) + "/api/firmware/latest?mac=" + g_deviceMac
                + "&version=" + String(FIRMWARE_VERSION);
     Serial.printf("[OTA] check %s\n", url.c_str());
 
@@ -2155,6 +2155,7 @@ static void check_firmware_update() {
 static String g_cur_ssid = WIFI_SSID;
 static String g_cur_pass = WIFI_PASS;
 static int    g_wifi_ver = 0;
+static String g_deviceMac;   // 运行时从硬件读取，无需逐台烧录写死 MAC
 
 static void load_wifi_creds(String &ssid, String &pass) {
     Preferences prefs;
@@ -2176,7 +2177,7 @@ static void save_wifi_creds(const String &ssid, const String &pass, int ver) {
 }
 
 static void ack_wifi_config(int ver, bool ok, const char* err) {
-    String url = String(SERVER_BASE) + "/api/device/" + String(DEVICE_MAC) + "/wifi/ack";
+    String url = String(SERVER_BASE) + "/api/device/" + g_deviceMac + "/wifi/ack";
     HTTPClient http;
     http.setTimeout(10000);
     http.setConnectTimeout(5000);
@@ -2191,7 +2192,7 @@ static void ack_wifi_config(int ver, bool ok, const char* err) {
 }
 
 static void check_wifi_config() {
-    String url = String(SERVER_BASE) + "/api/device/" + String(DEVICE_MAC) + "/wifi/pending";
+    String url = String(SERVER_BASE) + "/api/device/" + g_deviceMac + "/wifi/pending";
     HTTPClient http;
     http.setTimeout(10000);
     http.setConnectTimeout(5000);
@@ -2246,7 +2247,7 @@ static DNSServer*  prov_dns = nullptr;
 static String g_ap_ssid, g_ap_pass;
 
 static String prov_mac_last4() {
-    String m = String(DEVICE_MAC);
+    String m = g_deviceMac;
     String digits = "";
     for (char c : m) if (c != ':') digits += c;
     return digits.substring(digits.length() - 4);
@@ -2522,7 +2523,7 @@ static void record_and_upload_voice() {
     free(raw_buf);
     
     // Upload to server
-    String url = String(SERVER_BASE) + "/api/voice?mac=" + String(DEVICE_MAC);
+    String url = String(SERVER_BASE) + "/api/voice?mac=" + g_deviceMac;
     Serial.printf("[VOICE] Uploading %zu bytes to %s\n", wav_size, url.c_str());
     
     HTTPClient http;
@@ -2681,6 +2682,8 @@ void setup() {
     Serial.printf("[INIT] WiFi SSID from NVS: %s (ver=%d)\n", wifi_ssid.c_str(), g_wifi_ver);
     g_cur_ssid = wifi_ssid; g_cur_pass = wifi_pass;
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    g_deviceMac = WiFi.macAddress();   // 运行时读取本机 MAC，量产同二进制即可
+    Serial.printf("[INIT] Device MAC (auto-read): %s\n", g_deviceMac.c_str());
     int wifi_attempts = 0;
     while (WiFi.status() != WL_CONNECTED && wifi_attempts < 30) {
         delay(500);
@@ -2691,6 +2694,8 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[INIT] WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
         lcd_show_wifi_connected(WiFi.localIP().toString().c_str());
+        g_deviceMac = WiFi.macAddress();   // 连接成功后再次确认 MAC 已就绪
+        Serial.printf("[INIT] Device MAC (connected): %s\n", g_deviceMac.c_str());
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
         Serial.println("[INIT] NTP time sync initiated (async)");
     } else {
